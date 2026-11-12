@@ -11,12 +11,29 @@
 
 #include "audio_codec.h"
 
+struct AudioEngineDiagnostics {
+    uint32_t feed_frames = 0;
+    uint32_t feed_samples = 0;
+    uint32_t feed_wall_us = 0;
+    uint32_t feed_max_us = 0;
+    uint32_t feed_overruns = 0;
+    uint32_t fetch_frames = 0;
+    uint32_t fetch_samples = 0;
+    uint32_t fetch_errors = 0;
+};
+
 class AudioEngine {
 public:
     virtual ~AudioEngine() = default;
 
-    virtual bool Initialize(AudioCodec* codec, int frame_duration_ms, srmodel_list_t* models_list) = 0;
+    virtual bool Initialize(AudioCodec* codec, int frame_duration_ms,
+                            srmodel_list_t* models_list) = 0;
     virtual void Feed(std::vector<int16_t>&& data) = 0;
+    virtual void FeedPlaybackReference(const int16_t* data, size_t samples, int sample_rate,
+                                       int64_t output_time_us) {}
+    virtual void ResetPlaybackReference() {}
+    virtual void SetPlaybackReferenceDelay(int delay_ms) {}
+    virtual AudioEngineDiagnostics GetDiagnostics() const { return {}; }
 
     virtual void EnableWakeWordDetection(bool enable) = 0;
     virtual void EnableVoiceProcessing(bool enable) = 0;

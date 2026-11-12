@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -21,18 +22,25 @@ public:
     void WebSocketTx(const char* data, size_t length, bool success);
     void WebSocketRx(const char* data, size_t length);
     void Pcm(bool uplink, const uint8_t* data, size_t length, int sample_rate);
+    void AecPcm(const char* track, const int16_t* data, size_t samples, int64_t sample_start_us,
+                uint64_t sample_index);
 
 private:
+    struct FrameDeleter {
+        void operator()(uint8_t* data) const;
+    };
     struct Frame {
-        std::vector<uint8_t> bytes;
+        std::unique_ptr<uint8_t, FrameDeleter> bytes;
+        size_t size = 0;
     };
     DebugTrace();
     static void RunTask(void* arg);
     void Run();
     void Queue(uint16_t kind, const char* type, const char* detail, const uint8_t* payload,
                size_t length, int sample_rate = 0, int part_index = 0, int part_count = 0,
-               size_t total_length = 0, const char* message_id = "");
-    bool SendFrame(int socket, const std::vector<uint8_t>& frame);
+               size_t total_length = 0, const char* message_id = "", int64_t sample_start_us = 0,
+               uint64_t sample_index = 0);
+    bool SendFrame(int socket, const uint8_t* frame, size_t size);
 
     std::mutex mutex_;
     std::deque<Frame> queue_;

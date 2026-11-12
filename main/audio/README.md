@@ -30,8 +30,10 @@ wake-word detection and startup errors suppress the hint; subsequent idle transi
 do not repeat it.
 
 The AFE configuration currently uses `FD_LOW_COST` AEC with
-`AEC_NLP_LEVEL_VERYAGGR`. WebRTC/NSNet noise suppression is intentionally
-disabled because the project does not ship an NSNet model.
+`AEC_NLP_LEVEL_VERYAGGR`. The Waveshare 3.5B software-reference build can
+also enable the built-in WebRTC noise suppression stage with
+`CONFIG_WAVESHARE_3_5B_AEC_NS`; NSNet model-based suppression remains off
+because this project does not ship an NSNet model.
 
 When wake-word audio upload is enabled, the most recent two seconds of PCM are
 stored in a single 64 KB PSRAM ring buffer. WakeNet and MultiNet share the same

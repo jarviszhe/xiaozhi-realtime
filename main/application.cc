@@ -1144,7 +1144,11 @@ void Application::HandleStateChangedEvent() {
             display->SetEmotion("neutral");
 
             // Make sure the audio processor is running
-            if (play_popup_on_listening_ || !audio_service_.IsAudioProcessorRunning()) {
+            if (play_popup_on_listening_ || !audio_service_.IsAudioProcessorRunning()
+#if CONFIG_WAVESHARE_3_5B_SOFTWARE_AEC
+                || aliyun_mode_
+#endif
+            ) {
                 // For auto mode, wait for the playback queue to drain before enabling
                 // voice processing. This prevents audio truncation when STOP arrives
                 // late due to network jitter. Instead of blocking the main loop here,
@@ -1161,6 +1165,13 @@ void Application::HandleStateChangedEvent() {
         case kDeviceStateSpeaking:
             display->SetStatus(Lang::Strings::SPEAKING);
 
+#if CONFIG_WAVESHARE_3_5B_SOFTWARE_AEC
+            if (aliyun_mode_) {
+                audio_service_.EnableAecMonitoring();
+                audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
+                break;
+            }
+#endif
             if (listening_mode_ != kListeningModeRealtime) {
                 audio_service_.EnableVoiceProcessing(false);
                 // Only AFE wake word can be detected in speaking mode

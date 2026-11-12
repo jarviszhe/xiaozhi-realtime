@@ -1,6 +1,9 @@
 #include "audio_service.h"
 #include <esp_log.h>
 #include <cstring>
+#if CONFIG_WAVESHARE_3_5B_SOFTWARE_AEC
+#include "realtime/debug_trace.h"
+#endif
 
 #define RATE_CVT_CFG(_src_rate, _dest_rate, _channel)                                        \
     (esp_ae_rate_cvt_cfg_t) {                                                                \
@@ -85,7 +88,9 @@ void AudioService::Initialize(AudioCodec* codec) {
     audio_engine_ = std::make_unique<LiteAudioEngine>();
 #endif
     audio_engine_->OnOutput([this](std::vector<int16_t>&& data) {
-        PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
+        if (uplink_enabled_.load()) {
+            PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
+        }
     });
     audio_engine_->OnVadStateChange([this](bool speaking) {
         voice_detected_ = speaking;
@@ -173,6 +178,10 @@ void AudioService::Start() {
 void AudioService::Stop() {
     esp_timer_stop(audio_power_timer_);
     service_stopped_.store(true);
+    uplink_enabled_.store(false);
+    if (audio_engine_initialized_) {
+        audio_engine_->ResetPlaybackReference();
+    }
     xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING | AS_EVENT_WAKE_WORD_RUNNING |
                                          AS_EVENT_AUDIO_PROCESSOR_RUNNING);
 
@@ -334,6 +343,7 @@ void AudioService::AudioOutputTask() {
 
         auto task = std::move(audio_playback_queue_.front());
         audio_playback_queue_.pop_front();
+        const uint32_t generation = playback_generation_;
         output_in_flight_ = true;
         audio_queue_cv_.notify_all();
         lock.unlock();
@@ -344,11 +354,27 @@ void AudioService::AudioOutputTask() {
             codec_->EnableOutput(true);
         }
 
-        if (task.playback_id != 0 && callbacks_.on_playback_progress) {
-            callbacks_.on_playback_progress(task.playback_id, task.media_position_ms);
+        bool current_playback = false;
+        {
+            std::lock_guard<std::mutex> reference_lock(audio_queue_mutex_);
+            current_playback = generation == playback_generation_ && !service_stopped_.load();
+            if (current_playback && audio_engine_initialized_) {
+#if CONFIG_WAVESHARE_3_5B_SOFTWARE_AEC
+                DebugTrace::Instance().Pcm(false, reinterpret_cast<const uint8_t*>(task.pcm.data()),
+                                           task.pcm.size() * sizeof(int16_t),
+                                           codec_->output_sample_rate());
+#endif
+                audio_engine_->FeedPlaybackReference(task.pcm.data(), task.pcm.size(),
+                                                     codec_->output_sample_rate(),
+                                                     esp_timer_get_time());
+            }
         }
-
-        codec_->OutputData(task.pcm);
+        if (current_playback) {
+            if (task.playback_id != 0 && callbacks_.on_playback_progress) {
+                callbacks_.on_playback_progress(task.playback_id, task.media_position_ms);
+            }
+            codec_->OutputData(task.pcm);
+        }
 
         /* Update the last output time */
         last_output_time_ = std::chrono::steady_clock::now();
@@ -769,13 +795,29 @@ void AudioService::EnableVoiceProcessing(bool enable) {
             }
         }
         audio_engine_->EnableVoiceProcessing(true);
+        uplink_enabled_.store(true);
         xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_PROCESSOR_RUNNING);
     } else {
+        uplink_enabled_.store(false);
         if (audio_engine_initialized_) {
             audio_engine_->EnableVoiceProcessing(false);
         }
         xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_PROCESSOR_RUNNING);
     }
+}
+
+void AudioService::EnableAecMonitoring(int delay_ms) {
+#if CONFIG_WAVESHARE_3_5B_SOFTWARE_AEC
+    uplink_enabled_.store(false);
+    if (!InitializeAudioEngine()) {
+        return;
+    }
+    audio_engine_->SetPlaybackReferenceDelay(delay_ms < 0 ? CONFIG_WAVESHARE_3_5B_AEC_DELAY_MS
+                                                          : delay_ms);
+    audio_engine_->ResetPlaybackReference();
+    audio_engine_->EnableVoiceProcessing(true);
+    xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_PROCESSOR_RUNNING);
+#endif
 }
 
 void AudioService::EnableAudioTesting(bool enable) {
@@ -847,6 +889,9 @@ void AudioService::ResetDecoder() {
     {
         std::lock_guard<std::mutex> lock(audio_queue_mutex_);
         ++playback_generation_;
+        if (audio_engine_initialized_) {
+            audio_engine_->ResetPlaybackReference();
+        }
         std::unique_lock<std::mutex> decoder_lock(decoder_mutex_);
         if (opus_decoder_ != nullptr) {
             esp_opus_dec_reset(opus_decoder_);

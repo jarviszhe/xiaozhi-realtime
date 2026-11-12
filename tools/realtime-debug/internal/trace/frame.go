@@ -25,6 +25,9 @@ const (
 	PCMPlayback = 8
 	LocalEvent  = 9
 	TraceGap    = 10
+	AECMic      = 11
+	AECRef      = 12
+	AECOut      = 13
 )
 
 var kindNames = map[uint16]string{
@@ -32,6 +35,7 @@ var kindNames = map[uint16]string{
 	PCMUplink: "pcm_uplink", WSTX: "ws_tx", WSTXResult: "ws_tx_result",
 	WSRX: "ws_rx", PCMPlayback: "pcm_playback", LocalEvent: "local_event",
 	TraceGap: "trace_gap",
+	AECMic:   "aec_mic", AECRef: "aec_ref", AECOut: "aec_out",
 }
 
 type Meta struct {
@@ -57,6 +61,8 @@ type Meta struct {
 	PartIndex            int    `json:"part_index,omitempty"`
 	PartCount            int    `json:"part_count,omitempty"`
 	TotalLength          int    `json:"total_length,omitempty"`
+	SampleIndex          string `json:"sample_index,omitempty"`
+	SampleStartUS        int64  `json:"sample_start_us,omitempty"`
 }
 
 type Frame struct {
@@ -123,7 +129,7 @@ func ReadFrame(r io.Reader) (Frame, error) {
 			return Frame{}, errors.New("metadata field too long")
 		}
 	}
-	if kind == PCMUplink || kind == PCMPlayback {
+	if kind == PCMUplink || kind == PCMPlayback || kind == AECMic || kind == AECRef || kind == AECOut {
 		if meta.SampleRate <= 0 || meta.SampleRate > 192000 || meta.Channels < 1 || meta.Channels > 8 ||
 			(meta.BitsPerSample != 16 && meta.BitsPerSample != 24 && meta.BitsPerSample != 32) ||
 			meta.ByteOrder != "little" || meta.SampleFormat != "signed_int" {
@@ -131,6 +137,14 @@ func ReadFrame(r io.Reader) (Frame, error) {
 		}
 		if len(data[8+metaSize:])%(meta.Channels*meta.BitsPerSample/8) != 0 {
 			return Frame{}, errors.New("unaligned PCM payload")
+		}
+		if kind == AECMic || kind == AECRef || kind == AECOut {
+			if meta.SampleRate != 16000 || meta.Channels != 1 || meta.BitsPerSample != 16 || meta.SampleStartUS <= 0 || len(data[8+metaSize:]) == 0 {
+				return Frame{}, errors.New("invalid AEC audio format")
+			}
+			if _, err := strconv.ParseUint(meta.SampleIndex, 10, 64); err != nil {
+				return Frame{}, errors.New("invalid AEC sample_index")
+			}
 		}
 	}
 	if meta.PartCount < 0 || meta.PartIndex < 0 || (meta.PartCount == 0 && meta.PartIndex != 0) || (meta.PartCount > 0 && meta.PartIndex >= meta.PartCount) {

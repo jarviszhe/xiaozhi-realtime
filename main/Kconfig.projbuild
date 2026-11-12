@@ -15,6 +15,34 @@ config ALIYUN_REALTIME
         Adds the LAN device configuration page and Aliyun Realtime voice path.
         This first implementation targets the Waveshare ESP32-S3 Touch LCD 3.5B.
 
+config WAVESHARE_3_5B_SOFTWARE_AEC
+    bool "Enable software playback reference AEC on Waveshare 3.5B"
+    default y
+    depends on BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5B && USE_AUDIO_PROCESSOR && ALIYUN_REALTIME
+    help
+        Feed the ES8311 microphone and a copy of the played PCM to ESP-SR AFE.
+        Acoustic delay and suppression quality require validation on the board.
+
+config WAVESHARE_3_5B_AEC_DELAY_MS
+    int "Waveshare 3.5B playback reference delay (ms)"
+    default 0
+    range 0 250
+    depends on WAVESHARE_3_5B_SOFTWARE_AEC
+    help
+        Additional software delay applied to the submitted playback reference.
+        Start at zero so the reference precedes the microphone echo. Tune this
+        value using on-device M/R recordings; excessive delay prevents AEC.
+
+config WAVESHARE_3_5B_AEC_NS
+    bool "Enable WebRTC noise suppression with Waveshare 3.5B AEC"
+    default y
+    depends on WAVESHARE_3_5B_SOFTWARE_AEC
+    help
+        Run the built-in WebRTC noise suppression stage after AEC. This reduces
+        stationary microphone and room noise, but may affect soft speech and
+        increases AFE CPU and memory use. Validate with near-only and double-talk
+        recordings before releasing.
+
 choice
     prompt "Flash Assets"
     default FLASH_DEFAULT_ASSETS if !USE_EMOTE_MESSAGE_STYLE
@@ -1070,8 +1098,9 @@ config USE_AUDIO_PROCESSOR
     default y
     depends on (IDF_TARGET_ESP32S3 || IDF_TARGET_ESP32P4 || IDF_TARGET_ESP32S31) && SPIRAM
     help
-        Enable the shared AFE uplink path with AEC and VAD. Noise suppression
-        is not enabled because this project does not provide an NSNet model.
+        Enable the shared AFE uplink path with AEC and VAD. The Waveshare 3.5B
+        AEC experiment may additionally enable built-in WebRTC noise
+        suppression; NSNet model-based suppression is not included.
         Requires ESP32-S3, ESP32-P4, or ESP32-S31 with PSRAM.
 
 config USE_DEVICE_AEC

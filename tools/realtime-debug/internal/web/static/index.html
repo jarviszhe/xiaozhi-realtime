@@ -18,7 +18,7 @@
     </aside>
     <section class="timeline-pane">
       <div class="pane-head"><div><h2 id="session-title">选择会话</h2><p id="session-subtitle">选择左侧会话查看事件</p></div><a id="export" class="export" hidden>导出会话</a></div>
-      <div class="filters"><input id="search" type="search" placeholder="搜索事件、回复 ID 或详情" aria-label="搜索事件"><select id="kind" aria-label="事件类型"><option value="">所有事件</option><option value="ws_tx">发送消息</option><option value="ws_tx_result">发送结果</option><option value="ws_rx">接收消息</option><option value="pcm_uplink">上行 PCM</option><option value="pcm_playback">播放 PCM</option><option value="local_event">本地事件</option><option value="trace_gap">记录缺口</option></select></div>
+      <div class="filters"><input id="search" type="search" placeholder="搜索事件、回复 ID 或详情" aria-label="搜索事件"><select id="kind" aria-label="事件类型"><option value="">所有事件</option><option value="ws_tx">发送消息</option><option value="ws_tx_result">发送结果</option><option value="ws_rx">接收消息</option><option value="pcm_uplink">上行 PCM</option><option value="pcm_playback">播放 PCM</option><option value="aec_mic">AEC 麦克风</option><option value="aec_ref">AEC 参考</option><option value="aec_out">AEC 输出</option><option value="local_event">本地事件</option><option value="trace_gap">记录缺口</option></select></div>
       <div id="audio-tracks" class="audio-tracks" hidden></div>
       <div id="event-list" class="event-list"><div class="empty">等待选择会话</div></div>
       <button id="load-more" class="load-more" hidden>加载更多事件</button>

@@ -1,5 +1,6 @@
 #include "debug_trace.h"
 
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_random.h>
 #include <esp_timer.h>
@@ -47,6 +48,8 @@ std::string RandomId() {
 }  // namespace
 
 DebugTrace::DebugTrace() : boot_id_(RandomId()) {}
+
+void DebugTrace::FrameDeleter::operator()(uint8_t* data) const { heap_caps_free(data); }
 
 DebugTrace& DebugTrace::Instance() {
     static DebugTrace trace;
@@ -139,9 +142,35 @@ void DebugTrace::Pcm(bool uplink, const uint8_t* data, size_t length, int sample
     }
 }
 
+void DebugTrace::AecPcm(const char* track, const int16_t* data, size_t samples,
+                        int64_t sample_start_us, uint64_t sample_index) {
+    if (!enabled_ || level_ < 2 || data == nullptr || samples == 0) {
+        return;
+    }
+    uint16_t kind = 0;
+    if (strcmp(track, "aec_mic") == 0) {
+        kind = 11;
+    } else if (strcmp(track, "aec_ref") == 0) {
+        kind = 12;
+    } else if (strcmp(track, "aec_out") == 0) {
+        kind = 13;
+    } else {
+        return;
+    }
+    constexpr size_t kMaxSamples = kChunkSize / sizeof(int16_t);
+    for (size_t offset = 0; offset < samples; offset += kMaxSamples) {
+        const size_t count = std::min(kMaxSamples, samples - offset);
+        Queue(kind, track, "", reinterpret_cast<const uint8_t*>(data + offset),
+              count * sizeof(int16_t), 16000, 0, 0, 0, "",
+              sample_start_us + static_cast<int64_t>(offset) * 1000000 / 16000,
+              sample_index + offset);
+    }
+}
+
 void DebugTrace::Queue(uint16_t kind, const char* type, const char* detail, const uint8_t* payload,
                        size_t length, int sample_rate, int part_index, int part_count,
-                       size_t total_length, const char* message_id) {
+                       size_t total_length, const char* message_id, int64_t sample_start_us,
+                       uint64_t sample_index) {
     if (length > kChunkSize)
         return;
     std::lock_guard<std::mutex> lock(mutex_);
@@ -162,6 +191,12 @@ void DebugTrace::Queue(uint16_t kind, const char* type, const char* detail, cons
     snprintf(sequence, sizeof(sequence), "%llu", static_cast<unsigned long long>(++seq_));
     cJSON_AddStringToObject(meta, "seq", sequence);
     cJSON_AddNumberToObject(meta, "mono_us", static_cast<double>(esp_timer_get_time()));
+    if (kind >= 11 && kind <= 13) {
+        char index[24];
+        snprintf(index, sizeof(index), "%llu", static_cast<unsigned long long>(sample_index));
+        cJSON_AddStringToObject(meta, "sample_index", index);
+        cJSON_AddNumberToObject(meta, "sample_start_us", static_cast<double>(sample_start_us));
+    }
     if (sample_rate > 0) {
         cJSON_AddNumberToObject(meta, "sample_rate", sample_rate);
         cJSON_AddNumberToObject(meta, "channels", 1);
@@ -220,19 +255,32 @@ void DebugTrace::Queue(uint16_t kind, const char* type, const char* detail, cons
         frame.insert(frame.end(), json, json + meta_length);
         cJSON_free(json);
         while (queued_bytes_ + frame.size() > kMaxQueuedBytes && !queue_.empty()) {
-            queued_bytes_ -= queue_.front().bytes.size();
+            queued_bytes_ -= queue_.front().size;
             queue_.pop_front();
         }
     }
     cJSON_Delete(meta);
-    queued_bytes_ += frame.size();
-    queue_.push_back({std::move(frame)});
+    // Small PCM frames otherwise exhaust internal SRAM before malloc spills
+    // into PSRAM, preventing even session_close metadata from being created.
+#if CONFIG_SPIRAM_USE_MALLOC
+    constexpr uint32_t caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+#else
+    constexpr uint32_t caps = MALLOC_CAP_8BIT;
+#endif
+    Frame stored;
+    stored.bytes.reset(static_cast<uint8_t*>(heap_caps_malloc(frame.size(), caps)));
+    if (!stored.bytes)
+        return;
+    stored.size = frame.size();
+    std::memcpy(stored.bytes.get(), frame.data(), frame.size());
+    queued_bytes_ += stored.size;
+    queue_.push_back(std::move(stored));
 }
 
-bool DebugTrace::SendFrame(int socket, const std::vector<uint8_t>& frame) {
+bool DebugTrace::SendFrame(int socket, const uint8_t* frame, size_t size) {
     size_t offset = 0;
-    while (offset < frame.size()) {
-        int sent = send(socket, frame.data() + offset, frame.size() - offset, 0);
+    while (offset < size) {
+        int sent = send(socket, frame + offset, size - offset, 0);
         if (sent <= 0)
             return false;
         offset += sent;
@@ -276,22 +324,22 @@ void DebugTrace::Run() {
                 Write32(hello, size);
                 hello.insert(hello.end(), json, json + size);
                 cJSON_free(json);
-                if (SendFrame(socket, hello)) {
+                if (SendFrame(socket, hello.data(), hello.size())) {
                     for (;;) {
                         Frame frame;
                         {
                             std::lock_guard<std::mutex> lock(mutex_);
                             if (!queue_.empty()) {
-                                frame.bytes.swap(queue_.front().bytes);
-                                queued_bytes_ -= frame.bytes.size();
+                                frame = std::move(queue_.front());
+                                queued_bytes_ -= frame.size;
                                 queue_.pop_front();
                             }
                         }
-                        if (frame.bytes.empty()) {
+                        if (!frame.bytes) {
                             vTaskDelay(pdMS_TO_TICKS(30));
                             continue;
                         }
-                        const bool sent = SendFrame(socket, frame.bytes);
+                        const bool sent = SendFrame(socket, frame.bytes.get(), frame.size);
                         if (!sent)
                             break;
                     }

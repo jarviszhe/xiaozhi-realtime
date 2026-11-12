@@ -137,6 +137,12 @@ public:
     void EnableWakeWordDetection(bool enable);
     void ReleaseWakeWordResources();
     void EnableVoiceProcessing(bool enable);
+    void EnableAecMonitoring(int delay_ms = -1);
+    AudioEngineDiagnostics GetEngineDiagnostics() const {
+        return audio_engine_initialized_ ? audio_engine_->GetDiagnostics()
+                                         : AudioEngineDiagnostics{};
+    }
+    bool IsDeviceAecEnabled() const { return device_aec_enabled_; }
     void EnableAudioTesting(bool enable);
     void EnableDeviceAec(bool enable);
     void SetPcmTransport(bool enabled) { pcm_transport_.store(enabled); }
@@ -201,15 +207,16 @@ private:
     // For server AEC
     FixedQueue<uint32_t, MAX_TIMESTAMPS_IN_QUEUE> timestamp_queue_;
 
-    bool audio_engine_initialized_ = false;
+    std::atomic<bool> audio_engine_initialized_{false};
     bool voice_detected_ = false;
-#if CONFIG_USE_DEVICE_AEC
+#if CONFIG_USE_DEVICE_AEC || CONFIG_WAVESHARE_3_5B_SOFTWARE_AEC
     bool device_aec_enabled_ = true;
 #else
     bool device_aec_enabled_ = false;
 #endif
     std::atomic<bool> service_stopped_{true};
     std::atomic<bool> pcm_transport_{false};
+    std::atomic<bool> uplink_enabled_{false};
     std::atomic<bool> audio_input_need_warmup_{false};
 
     esp_timer_handle_t audio_power_timer_ = nullptr;

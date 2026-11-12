@@ -11,6 +11,9 @@
 #include <vector>
 
 #include <esp_afe_sr_models.h>
+#if CONFIG_WAVESHARE_3_5B_SOFTWARE_AEC
+#include <esp_ae_rate_cvt.h>
+#endif
 #include <freertos/FreeRTOS.h>
 #include <freertos/event_groups.h>
 #include <freertos/task.h>
@@ -27,6 +30,11 @@ public:
 
     bool Initialize(AudioCodec* codec, int frame_duration_ms, srmodel_list_t* models_list) override;
     void Feed(std::vector<int16_t>&& data) override;
+    void FeedPlaybackReference(const int16_t* data, size_t samples, int sample_rate,
+                               int64_t output_time_us) override;
+    void ResetPlaybackReference() override;
+    void SetPlaybackReferenceDelay(int delay_ms) override;
+    AudioEngineDiagnostics GetDiagnostics() const override;
 
     void EnableWakeWordDetection(bool enable) override;
     void EnableVoiceProcessing(bool enable) override;
@@ -88,6 +96,35 @@ private:
     std::vector<int16_t> input_buffer_;
     std::vector<int16_t> output_buffer_;
     std::mutex input_buffer_mutex_;
+#if CONFIG_WAVESHARE_3_5B_SOFTWARE_AEC
+    static constexpr size_t kReferenceCapacity = 16000;
+    std::mutex reference_mutex_;
+    esp_ae_rate_cvt_handle_t reference_resampler_ = nullptr;
+    int16_t* reference_ring_ = nullptr;
+    int64_t reference_start_us_ = 0;
+    uint64_t reference_written_ = 0;
+    int64_t playback_reference_start_us_ = 0;
+    uint64_t playback_reference_samples_ = 0;
+    std::vector<int16_t> reference_resampled_;
+    std::vector<int16_t> aligned_reference_;
+    std::vector<int16_t> interleaved_input_;
+    uint64_t input_sample_index_ = 0;
+    uint64_t output_sample_index_ = 0;
+    bool reference_nonzero_logged_ = false;
+    bool aligned_reference_nonzero_logged_ = false;
+    uint32_t reference_debug_feed_count_ = 0;
+    std::atomic<int64_t> input_origin_us_{0};
+    std::atomic<int> reference_delay_ms_{CONFIG_WAVESHARE_3_5B_AEC_DELAY_MS};
+    bool software_reference_ready_ = false;
+    std::atomic<uint32_t> diagnostic_feed_frames_{0};
+    std::atomic<uint32_t> diagnostic_feed_samples_{0};
+    std::atomic<uint32_t> diagnostic_feed_wall_us_{0};
+    std::atomic<uint32_t> diagnostic_feed_max_us_{0};
+    std::atomic<uint32_t> diagnostic_feed_overruns_{0};
+    std::atomic<uint32_t> diagnostic_fetch_frames_{0};
+    std::atomic<uint32_t> diagnostic_fetch_samples_{0};
+    std::atomic<uint32_t> diagnostic_fetch_errors_{0};
+#endif
 
     std::function<void(const std::string&)> wake_word_detected_callback_;
     std::function<void(std::vector<int16_t>&&)> output_callback_;

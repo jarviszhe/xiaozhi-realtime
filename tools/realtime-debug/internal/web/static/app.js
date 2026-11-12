@@ -70,12 +70,13 @@ async function selectSession(id) {
 }
 
 function renderAudio(info) {
-  const signature = JSON.stringify([info.uplink, info.playback].map(segments => (segments || []).map(segment => [segment.index, segment.length, segment.sample_rate, segment.channels, segment.bits_per_sample])));
+  const tracks = [['uplink', '上行 PCM'], ['playback', '播放 PCM'], ['aec_mic', 'AEC 麦克风'], ['aec_ref', 'AEC 参考'], ['aec_out', 'AEC 输出']];
+  const signature = JSON.stringify(tracks.map(([track]) => (info[track] || []).map(segment => [segment.index, segment.length, segment.sample_rate, segment.channels, segment.bits_per_sample])));
   if (signature === state.audioSignature) return;
   state.audioSignature = signature;
   const root = byId('audio-tracks');
   root.replaceChildren();
-  for (const [track, label] of [['uplink', '上行 PCM'], ['playback', '播放 PCM']]) {
+  for (const [track, label] of tracks) {
     for (const segment of info[track] || []) {
       const row = document.createElement('div');
       row.className = 'audio-row';

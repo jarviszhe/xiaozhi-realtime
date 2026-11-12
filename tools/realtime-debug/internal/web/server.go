@@ -87,7 +87,22 @@ func (s *Server) session(w http.ResponseWriter, r *http.Request) {
 			fail(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		jsonResponse(w, map[string]any{"summary": summary, "uplink": uplink, "playback": playback})
+		mic, err := s.store.Segments(id, "aec_mic")
+		if err != nil {
+			fail(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		ref, err := s.store.Segments(id, "aec_ref")
+		if err != nil {
+			fail(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		out, err := s.store.Segments(id, "aec_out")
+		if err != nil {
+			fail(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		jsonResponse(w, map[string]any{"summary": summary, "uplink": uplink, "playback": playback, "aec_mic": mic, "aec_ref": ref, "aec_out": out})
 		return
 	}
 	switch parts[1] {
@@ -95,6 +110,17 @@ func (s *Server) session(w http.ResponseWriter, r *http.Request) {
 		s.events(w, r, id, parts)
 	case "audio":
 		s.audio(w, r, id, parts)
+	case "aec-report":
+		if len(parts) != 2 {
+			fail(w, http.StatusNotFound, "unknown endpoint")
+			return
+		}
+		report, err := s.store.AnalyzeAEC(id)
+		if err != nil {
+			fail(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		jsonResponse(w, report)
 	case "export":
 		if len(parts) != 2 {
 			fail(w, http.StatusNotFound, "unknown endpoint")
