@@ -265,6 +265,7 @@ private:
     }
 
     void InitializeButtons() {
+        boot_button_.OnDoubleClick([]() { Application::GetInstance().CycleListeningMode(); });
         boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting) {

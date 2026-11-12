@@ -101,6 +101,7 @@ struct AudioTask {
     uint32_t timestamp = 0;
     uint32_t playback_id = 0;
     uint32_t media_position_ms = 0;
+    uint32_t generation = 0;
 };
 
 struct DebugStatistics {
@@ -123,7 +124,6 @@ public:
     std::unique_ptr<AudioStreamPacket> PopWakeWordPacket();
     const std::string& GetLastWakeWord() const;
     std::vector<std::string> GetWakeWords() const;
-    bool IsVoiceDetected() const { return voice_detected_; }
     bool IsIdle();
     bool IsPlaybackIdle();
     bool IsWakeWordRunning() const {
@@ -138,11 +138,14 @@ public:
     void ReleaseWakeWordResources();
     void EnableVoiceProcessing(bool enable);
     void EnableAecMonitoring(int delay_ms = -1);
+    bool SupportsRealtime() const;
+    void ConfigureConversationAec(bool realtime);
     AudioEngineDiagnostics GetEngineDiagnostics() const {
         return audio_engine_initialized_ ? audio_engine_->GetDiagnostics()
                                          : AudioEngineDiagnostics{};
     }
     bool IsDeviceAecEnabled() const { return device_aec_enabled_; }
+    bool IsVoiceDetected() const { return voice_detected_; }
     void EnableAudioTesting(bool enable);
     void EnableDeviceAec(bool enable);
     void SetPcmTransport(bool enabled) { pcm_transport_.store(enabled); }
@@ -154,7 +157,7 @@ public:
     bool WaitForEncodeIdle(int timeout_ms);
     void PlaySound(const std::string_view& sound);
     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
-    void ResetDecoder();
+    void ResetDecoder(bool reset_reference = true);
     void SetModelsList(srmodel_list_t* models_list);
 
 private:
@@ -204,6 +207,7 @@ private:
     bool output_in_flight_ = false;
     bool playback_drained_notified_ = true;
     uint32_t playback_generation_ = 0;
+    uint32_t capture_generation_ = 0;
     // For server AEC
     FixedQueue<uint32_t, MAX_TIMESTAMPS_IN_QUEUE> timestamp_queue_;
 

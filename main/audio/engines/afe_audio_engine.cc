@@ -14,6 +14,7 @@
 #include <esp_vadn_models.h>
 
 #include "audio_service.h"
+#include "playback_timeline.h"
 #include "wake_words/custom_wake_word.h"
 #if CONFIG_WAVESHARE_3_5B_SOFTWARE_AEC
 #include "realtime/debug_trace.h"
@@ -179,8 +180,8 @@ bool AfeAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms,
     afe_config->aec_init = ref_num > 0;
     afe_config->aec_mode = AEC_MODE_FD_LOW_COST;
     afe_config->aec_nlp_level = AEC_NLP_LEVEL_VERYAGGR;
-    // The ESP-SR 1-mic AFE uses se_init for its built-in WebRTC noise
-    // suppression stage. Keep ns_init false because no NSNet model is loaded.
+    // Request SE as configured; ESP-SR may disable it for single-mic layouts.
+    // No NSNet model is loaded, so ns_init remains false.
     afe_config->se_init = CONFIG_WAVESHARE_3_5B_AEC_NS;
     afe_config->ns_init = false;
     afe_config->vad_init = kUseAfeForVoiceProcessing;
@@ -338,7 +339,9 @@ void AfeAudioEngine::Feed(std::vector<int16_t>&& data) {
         const int64_t expected_us =
             origin_us + static_cast<int64_t>(input_sample_index_) * 1000000 / 16000;
         int64_t start_us = expected_us;
-        if (origin_us == 0 || observed_start_us < expected_us - 100000 ||
+        // A capture timestamp must not run ahead of the DMA read. A large
+        // forward lead asks for playback reference that has not been written.
+        if (origin_us == 0 || observed_start_us < expected_us - 20000 ||
             observed_start_us > expected_us + 100000) {
             start_us = observed_start_us;
             input_origin_us_.store(start_us -
@@ -435,6 +438,7 @@ void AfeAudioEngine::Feed(std::vector<int16_t>&& data) {
 
 AudioEngineDiagnostics AfeAudioEngine::GetDiagnostics() const {
     AudioEngineDiagnostics result;
+    result.aec_enabled = applied_aec_enabled_.load();
 #if CONFIG_WAVESHARE_3_5B_SOFTWARE_AEC
     result.feed_frames = diagnostic_feed_frames_.load();
     result.feed_samples = diagnostic_feed_samples_.load();
@@ -488,21 +492,17 @@ void AfeAudioEngine::FeedPlaybackReference(const int16_t* data, size_t samples, 
         DebugTrace::Instance().Event("aec_ref_feed_stats", detail);
         reference_nonzero_logged_ = max_abs > 0;
     }
-    DebugTrace::Instance().Event("aec_ref_feed", "playback reference accepted");
-    if (playback_reference_start_us_ == 0) {
-        playback_reference_start_us_ =
-            output_time_us + static_cast<int64_t>(reference_delay_ms_.load()) * 1000;
-    }
-    const int64_t start_us = playback_reference_start_us_ +
-                             static_cast<int64_t>(playback_reference_samples_) * 1000000 / 24000;
-    playback_reference_samples_ += samples;
+    const int64_t start_us = AdvancePlaybackTimeline(
+        output_time_us + static_cast<int64_t>(reference_delay_ms_.load()) * 1000,
+        playback_reference_start_us_, playback_reference_samples_, samples, sample_rate);
     if (reference_start_us_ == 0) {
         reference_start_us_ = start_us;
     }
-    const int64_t expected = (start_us - reference_start_us_) * 16000 / 1000000;
+    int64_t expected = (start_us - reference_start_us_) * 16000 / 1000000;
     if (expected < 0 || expected > static_cast<int64_t>(reference_written_ + 16000)) {
         reference_start_us_ = start_us;
         reference_written_ = 0;
+        expected = 0;
     }
     const int64_t index = std::max<int64_t>(expected, reference_written_);
     while (static_cast<int64_t>(reference_written_) < index) {
@@ -589,6 +589,26 @@ void AfeAudioEngine::EnableDeviceAec(bool enable) {
     UpdateAecState();
 }
 
+void AfeAudioEngine::SetPlaybackAecOnly(bool enable) {
+    playback_aec_only_.store(enable);
+    afe_control_dirty_.store(true);
+}
+
+void AfeAudioEngine::PreparePlayback() {
+    // Cover TX DMA, AFE buffering and the acoustic tail. Renewed at each write.
+    playback_aec_until_us_.store(esp_timer_get_time() + 300000);
+    afe_control_dirty_.store(true);
+}
+
+bool AfeAudioEngine::HasAecReference() const {
+    return kUseAfeForVoiceProcessing && afe_data_ != nullptr && codec_ != nullptr &&
+           (codec_->input_reference()
+#if CONFIG_WAVESHARE_3_5B_SOFTWARE_AEC
+            || software_reference_ready_
+#endif
+           );
+}
+
 bool AfeAudioEngine::HasWakeWord() const { return wake_detector_ != WakeDetector::kNone; }
 
 std::vector<std::string> AfeAudioEngine::GetWakeWords() const {
@@ -664,10 +684,13 @@ void AfeAudioEngine::UpdateAecState() {
 void AfeAudioEngine::ApplyAfeControls() {
     EventBits_t bits = xEventGroupGetBits(event_group_);
     if (wake_detector_ == WakeDetector::kWakeNet) {
-        if (bits & kWakeWordEnabled) {
-            afe_iface_->enable_wakenet(afe_data_);
-        } else {
-            afe_iface_->disable_wakenet(afe_data_);
+        const bool enable_wake = (bits & kWakeWordEnabled) != 0;
+        if (enable_wake != applied_wake_enabled_) {
+            if (enable_wake)
+                afe_iface_->enable_wakenet(afe_data_);
+            else
+                afe_iface_->disable_wakenet(afe_data_);
+            applied_wake_enabled_ = enable_wake;
         }
     }
     if (codec_->input_reference()
@@ -675,12 +698,21 @@ void AfeAudioEngine::ApplyAfeControls() {
         || software_reference_ready_
 #endif
     ) {
-        const bool enable_aec = (bits & kWakeWordEnabled) ||
-                                (device_aec_enabled_.load() && (bits & kVoiceProcessingEnabled));
-        if (enable_aec) {
-            afe_iface_->enable_aec(afe_data_);
-        } else {
-            afe_iface_->disable_aec(afe_data_);
+        const bool enable_aec =
+            playback_aec_only_.load()
+                ? device_aec_enabled_.load() && esp_timer_get_time() < playback_aec_until_us_.load()
+                : (bits & kWakeWordEnabled) ||
+                      (device_aec_enabled_.load() && (bits & kVoiceProcessingEnabled));
+        if (enable_aec != applied_aec_enabled_) {
+            if (enable_aec) {
+                afe_iface_->enable_aec(afe_data_);
+            } else {
+                afe_iface_->disable_aec(afe_data_);
+            }
+            applied_aec_enabled_ = enable_aec;
+#if CONFIG_WAVESHARE_3_5B_SOFTWARE_AEC
+            DebugTrace::Instance().Event("aec_processing", enable_aec ? "on" : "bypass");
+#endif
         }
     }
 }
@@ -703,7 +735,7 @@ void AfeAudioEngine::ProcessingTask() {
         if ((xEventGroupGetBits(event_group_) & kAfeActive) == 0) {
             continue;
         }
-        if (afe_control_dirty_.exchange(false)) {
+        if (afe_control_dirty_.exchange(false) || playback_aec_only_.load()) {
             // WakeNet/AEC toggles are not safe against a concurrent fetch,
             // so they are applied here, in the task that owns the fetch side.
             ApplyAfeControls();

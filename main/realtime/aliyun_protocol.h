@@ -7,11 +7,13 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include <web_socket.h>
 #include "config.h"
 #include "protocol.h"
+#include "response_tracker.h"
 
 class AliyunProtocol final : public Protocol {
 public:
@@ -29,10 +31,17 @@ public:
     void SendWakeWordDetected(const std::string& wake_word) override;
     void SendMcpMessage(const std::string& message) override;
 
-    void OnResponseStarted(std::function<void()> callback) {
+    void OnResponseStarted(std::function<void(uint64_t)> callback) {
         on_response_started_ = std::move(callback);
     }
-    void OnResponseDone(std::function<void()> callback) { on_response_done_ = std::move(callback); }
+    void OnResponseDone(std::function<void(uint64_t)> callback) {
+        on_response_done_ = std::move(callback);
+    }
+    void OnSpeechStarted(std::function<void(uint64_t)> callback) {
+        on_speech_started_ = std::move(callback);
+    }
+    bool IsCurrentResponse(uint64_t token) const;
+    uint32_t connection_generation() const { return connection_generation_.load(); }
     void OnTranscript(std::function<void(bool user, const std::string&)> callback) {
         on_transcript_ = std::move(callback);
     }
@@ -41,19 +50,24 @@ protected:
     bool SendText(const std::string& text) override;
 
 private:
-    void HandleEvent(const char* data, size_t size);
+    void HandleEvent(const char* data, size_t size, uint32_t generation);
+    uint64_t ResponseToken() const;
+    void CancelResponse(uint64_t token);
     AliyunRealtimeConfig config_;
     std::shared_ptr<WebSocket> websocket_;
     EventGroupHandle_t ready_events_ = nullptr;
     std::atomic<bool> listening_{false};
     std::atomic<bool> manual_{true};
     std::atomic<bool> waiting_commit_{false};
-    std::atomic<bool> response_active_{false};
+    std::atomic<bool> realtime_{false};
     std::atomic<bool> trace_open_{false};
     std::atomic<uint32_t> connection_generation_{0};
-    std::string response_id_;
-    std::function<void()> on_response_started_;
-    std::function<void()> on_response_done_;
+    mutable std::mutex response_mutex_;
+    RealtimeResponseTracker response_;
+    std::string cancel_event_id_;
+    std::function<void(uint64_t)> on_response_started_;
+    std::function<void(uint64_t)> on_response_done_;
+    std::function<void(uint64_t)> on_speech_started_;
     std::function<void(bool, const std::string&)> on_transcript_;
 };
 

@@ -12,6 +12,7 @@
 #include "audio_codec.h"
 
 struct AudioEngineDiagnostics {
+    bool aec_enabled = false;
     uint32_t feed_frames = 0;
     uint32_t feed_samples = 0;
     uint32_t feed_wall_us = 0;
@@ -33,6 +34,9 @@ public:
                                        int64_t output_time_us) {}
     virtual void ResetPlaybackReference() {}
     virtual void SetPlaybackReferenceDelay(int delay_ms) {}
+    virtual void SetPlaybackAecOnly(bool enable) {}
+    virtual void PreparePlayback() {}
+    virtual bool HasAecReference() const { return false; }
     virtual AudioEngineDiagnostics GetDiagnostics() const { return {}; }
 
     virtual void EnableWakeWordDetection(bool enable) = 0;

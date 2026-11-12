@@ -30,10 +30,11 @@ wake-word detection and startup errors suppress the hint; subsequent idle transi
 do not repeat it.
 
 The AFE configuration currently uses `FD_LOW_COST` AEC with
-`AEC_NLP_LEVEL_VERYAGGR`. The Waveshare 3.5B software-reference build can
-also enable the built-in WebRTC noise suppression stage with
-`CONFIG_WAVESHARE_3_5B_AEC_NS`; NSNet model-based suppression remains off
-because this project does not ship an NSNet model.
+`AEC_NLP_LEVEL_VERYAGGR`. `CONFIG_WAVESHARE_3_5B_AEC_NS` requests speech
+enhancement through `se_init`, but the current ESP-SR pipeline reports that SE
+is disabled for the board's single microphone. This flag does not establish
+working noise suppression. NSNet remains off because this project does not ship
+an NSNet model.
 
 When wake-word audio upload is enabled, the most recent two seconds of PCM are
 stored in a single 64 KB PSRAM ring buffer. WakeNet and MultiNet share the same
@@ -82,6 +83,21 @@ Wake-word detection and voice processing are independent runtime states on the
 same engine. On AFE targets, AEC stays active while wake-word detection is active
 so playback reference remains available for wake-up during device playback. It
 also stays active during voice processing when device AEC is requested.
+
+Conversation mode selection can override that default: Manual and Auto disable
+device AEC; Realtime keeps microphone processing and uplink active during reply
+playback. The playback-only policy arms AEC when audio enters the playback queue,
+renews it for actual codec writes, and keeps a provisional 300 ms DMA/acoustic
+tail before bypassing. Controls run on the AFE fetch task without recreating the
+engine. Tail length and the effect of re-enabling AEC require board validation.
+`EnableAecMonitoring()` retains continuous AEC for deterministic diagnostics.
+
+Enabling already-active voice processing is idempotent: switching the UI between
+Listening and Speaking must not reset the playback or input resampler. A new
+capture session invalidates queued/in-flight uploads from the previous session.
+Playback cancellation retains the reference for samples already submitted to DMA
+and rejects queued/in-flight old audio; codec writes are split into 20 ms chunks.
+This bounds a pending software write, not the complete acoustic stop latency.
 
 ## Output data flow
 

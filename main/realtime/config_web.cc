@@ -39,6 +39,13 @@ cJSON* ResourceSnapshot() {
     if (!root)
         return nullptr;
     cJSON_AddNumberToObject(root, "time_us", esp_timer_get_time());
+    auto& app = Application::GetInstance();
+    cJSON_AddStringToObject(root, "state", DeviceStateMachine::GetStateName(app.GetDeviceState()));
+    const auto mode = app.GetConversationMode();
+    cJSON_AddStringToObject(root, "mode",
+                            mode == kListeningModeManualStop ? "manual"
+                            : mode == kListeningModeRealtime ? "realtime"
+                                                             : "auto");
     cJSON_AddNumberToObject(root, "cores", CONFIG_FREERTOS_NUMBER_OF_CORES);
     cJSON_AddNumberToObject(root, "internal_free", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     cJSON_AddNumberToObject(root, "internal_min_since_boot",
@@ -50,6 +57,7 @@ cJSON* ResourceSnapshot() {
                             heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM));
     const auto audio = Application::GetInstance().GetAudioService().GetEngineDiagnostics();
     cJSON* engine = cJSON_AddObjectToObject(root, "engine");
+    cJSON_AddBoolToObject(engine, "aec_enabled", audio.aec_enabled);
     cJSON_AddNumberToObject(engine, "feed_frames", audio.feed_frames);
     cJSON_AddNumberToObject(engine, "feed_samples", audio.feed_samples);
     cJSON_AddNumberToObject(engine, "feed_wall_us", audio.feed_wall_us);
@@ -104,6 +112,27 @@ esp_err_t GetPage(httpd_req_t* request) {
     httpd_resp_set_type(request, "text/html; charset=utf-8");
     httpd_resp_set_hdr(request, "Cache-Control", "no-store");
     return httpd_resp_send(request, config_html_start, config_html_end - config_html_start);
+}
+
+esp_err_t PostTestChat(httpd_req_t* request) {
+    if (!LoadAliyunRealtimeConfig().debug_enabled)
+        return Reply(request, "403 Forbidden", "{\"error\":\"debug_disabled\"}");
+    char query[64] = {};
+    char action[16] = {};
+    if (request->content_len != 0 ||
+        httpd_req_get_url_query_str(request, query, sizeof(query)) != ESP_OK ||
+        httpd_query_key_value(query, "action", action, sizeof(action)) != ESP_OK)
+        return Reply(request, "400 Bad Request", "{\"error\":\"invalid_action\"}");
+    auto& app = Application::GetInstance();
+    if (strcmp(action, "cycle") == 0)
+        app.CycleListeningMode();
+    else if (strcmp(action, "click") == 0)
+        app.ToggleChatState();
+    else if (strcmp(action, "stop") == 0)
+        app.EndConversation();
+    else
+        return Reply(request, "400 Bad Request", "{\"error\":\"invalid_action\"}");
+    return Reply(request, "202 Accepted", "{\"queued\":true}");
 }
 
 esp_err_t GetConfig(httpd_req_t* request) {
@@ -258,7 +287,7 @@ esp_err_t PostTestPcm(httpd_req_t* request) {
     audio.EnableWakeWordDetection(false);
     // Let the last 10 ms read finish before clearing the test time line.
     vTaskDelay(pdMS_TO_TICKS(50));
-    DebugTrace::Instance().Open("manual");
+    DebugTrace::Instance().Open("manual", true);
     audio.EnableDeviceAec(aec_enabled != 0);
     audio.EnableAecMonitoring(delay_ms);
     char options[80];
@@ -328,7 +357,7 @@ void StartAliyunConfigWeb() {
         return;
     httpd_config_t settings = HTTPD_DEFAULT_CONFIG();
     settings.server_port = 80;
-    settings.max_uri_handlers = 5;
+    settings.max_uri_handlers = 6;
     if (httpd_start(&server, &settings) != ESP_OK) {
         ESP_LOGE(kTag, "Failed to start configuration server");
         server = nullptr;
@@ -340,11 +369,13 @@ void StartAliyunConfigWeb() {
     httpd_uri_t test_pcm = {.uri = "/api/test/pcm", .method = HTTP_POST, .handler = PostTestPcm};
     httpd_uri_t test_stats = {
         .uri = "/api/test/stats", .method = HTTP_GET, .handler = GetTestStats};
+    httpd_uri_t test_chat = {.uri = "/api/test/chat", .method = HTTP_POST, .handler = PostTestChat};
     httpd_register_uri_handler(server, &page);
     httpd_register_uri_handler(server, &get);
     httpd_register_uri_handler(server, &put);
     httpd_register_uri_handler(server, &test_pcm);
     httpd_register_uri_handler(server, &test_stats);
+    httpd_register_uri_handler(server, &test_chat);
     ESP_LOGI(kTag, "Configuration page listening on port 80");
 }
 

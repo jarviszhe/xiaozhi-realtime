@@ -39,6 +39,9 @@ public:
     void EnableWakeWordDetection(bool enable) override;
     void EnableVoiceProcessing(bool enable) override;
     void EnableDeviceAec(bool enable) override;
+    void SetPlaybackAecOnly(bool enable) override;
+    void PreparePlayback() override;
+    bool HasAecReference() const override;
 
     bool HasWakeWord() const override;
     bool IsWakeWordDetectionEnabled() const override;
@@ -79,6 +82,10 @@ private:
     int frame_samples_ = 0;
     bool is_speaking_ = false;
     std::atomic<bool> device_aec_enabled_{false};
+    std::atomic<bool> playback_aec_only_{false};
+    std::atomic<int64_t> playback_aec_until_us_{0};
+    std::atomic<bool> applied_aec_enabled_{false};
+    bool applied_wake_enabled_ = false;
     // Deferred AFE buffer reset, performed by ProcessingTask (see UpdateActiveState)
     std::atomic<bool> reset_pending_{false};
     // Deferred WakeNet/AEC toggles, applied by ProcessingTask (see ApplyAfeControls)

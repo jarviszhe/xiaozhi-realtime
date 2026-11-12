@@ -9,11 +9,13 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <lwip/sockets.h>
+#include <lwip/tcp.h>
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 
 #include "system_info.h"
 
@@ -25,6 +27,8 @@ constexpr size_t kMaxQueuedBytes = 512 * 1024;
 constexpr size_t kMaxQueuedBytes = 128 * 1024;
 #endif
 constexpr size_t kChunkSize = 8192;
+constexpr size_t kSendBatchSize = 16 * 1024;
+constexpr size_t kCloseReserveBytes = 4096;
 constexpr uint32_t kTaskStackBytes = 8192;
 
 void Write16(std::vector<uint8_t>& bytes, uint16_t value) {
@@ -76,15 +80,22 @@ void DebugTrace::Configure(const AliyunRealtimeConfig& config) {
     }
 }
 
-void DebugTrace::Open(const char* mode) {
+void DebugTrace::Open(const char* mode, bool capture_aec) {
     if (!enabled_)
         return;
+    std::lock_guard<std::mutex> aec_lock(aec_mutex_);
+    if (capture_aec && level_ >= 2 && !aec_batches_)
+        aec_batches_.reset(new (std::nothrow) std::array<AecBatch, 3>);
+    capture_aec_.store(capture_aec && aec_batches_ != nullptr);
+    if (aec_batches_)
+        for (auto& batch : *aec_batches_)
+            batch.samples = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         trace_id_ = RandomId();
         mode_ = mode;
     }
-    Queue(2, "session_open", "", nullptr, 0);
+    Queue(2, "session_open", capture_aec ? "aec_tracks" : "conversation", nullptr, 0);
 }
 
 void DebugTrace::SetMode(const char* mode) {
@@ -95,6 +106,11 @@ void DebugTrace::SetMode(const char* mode) {
 void DebugTrace::Close() {
     if (!enabled_)
         return;
+    std::lock_guard<std::mutex> aec_lock(aec_mutex_);
+    capture_aec_.store(false);
+    if (aec_batches_)
+        for (size_t i = 0; i < aec_batches_->size(); ++i)
+            FlushAecBatch(i);
     Queue(3, "session_close", "", nullptr, 0);
     std::lock_guard<std::mutex> lock(mutex_);
     trace_id_.clear();
@@ -105,11 +121,11 @@ void DebugTrace::Event(const char* type, const char* detail) {
         Queue(9, type, detail, nullptr, 0);
 }
 
-void DebugTrace::WebSocketTx(const char* data, size_t length, bool success) {
+void DebugTrace::WebSocketTx(const char* data, size_t length, bool success, bool audio) {
     if (!enabled_)
         return;
     const std::string message_id = RandomId();
-    if (level_ >= 1) {
+    if (level_ >= 1 && !(level_ >= 2 && audio)) {
         const size_t count = (length + kChunkSize - 1) / kChunkSize;
         for (size_t part = 0; part < count && part < 128; ++part) {
             const size_t offset = part * kChunkSize;
@@ -121,9 +137,15 @@ void DebugTrace::WebSocketTx(const char* data, size_t length, bool success) {
     Queue(6, "ws_tx_result", success ? "ok" : "failed", nullptr, 0, 0, 0, 0, 0, message_id.c_str());
 }
 
-void DebugTrace::WebSocketRx(const char* data, size_t length) {
+void DebugTrace::WebSocketRx(const char* data, size_t length, bool audio) {
     if (!enabled_ || level_ < 1)
         return;
+    // PCM captures already contain this audio. Duplicating Base64 alongside
+    // three AEC tracks can overload Wi-Fi and alter the timing being measured.
+    if (level_ >= 2 && audio) {
+        Queue(9, "response_audio_received", "", nullptr, 0);
+        return;
+    }
     const std::string message_id = RandomId();
     const size_t count = (length + kChunkSize - 1) / kChunkSize;
     for (size_t part = 0; part < count && part < 128; ++part) {
@@ -144,7 +166,8 @@ void DebugTrace::Pcm(bool uplink, const uint8_t* data, size_t length, int sample
 
 void DebugTrace::AecPcm(const char* track, const int16_t* data, size_t samples,
                         int64_t sample_start_us, uint64_t sample_index) {
-    if (!enabled_ || level_ < 2 || data == nullptr || samples == 0) {
+    if (!enabled_ || level_ < 2 || !capture_aec_.load() || data == nullptr || samples == 0 ||
+        sample_start_us <= 0) {
         return;
     }
     uint16_t kind = 0;
@@ -157,14 +180,36 @@ void DebugTrace::AecPcm(const char* track, const int16_t* data, size_t samples,
     } else {
         return;
     }
-    constexpr size_t kMaxSamples = kChunkSize / sizeof(int16_t);
-    for (size_t offset = 0; offset < samples; offset += kMaxSamples) {
-        const size_t count = std::min(kMaxSamples, samples - offset);
-        Queue(kind, track, "", reinterpret_cast<const uint8_t*>(data + offset),
-              count * sizeof(int16_t), 16000, 0, 0, 0, "",
-              sample_start_us + static_cast<int64_t>(offset) * 1000000 / 16000,
-              sample_index + offset);
+    std::lock_guard<std::mutex> aec_lock(aec_mutex_);
+    const size_t track_index = kind - 11;
+    auto& batch = (*aec_batches_)[track_index];
+    if (batch.samples &&
+        (sample_index != batch.index + batch.samples ||
+         std::abs(sample_start_us -
+                  (batch.start_us + static_cast<int64_t>(batch.samples) * 1000000 / 16000)) > 2000))
+        FlushAecBatch(track_index);
+    for (size_t offset = 0; offset < samples;) {
+        if (batch.samples == 0) {
+            batch.start_us = sample_start_us + static_cast<int64_t>(offset) * 1000000 / 16000;
+            batch.index = sample_index + offset;
+        }
+        const size_t count = std::min(samples - offset, batch.data.size() - batch.samples);
+        std::copy_n(data + offset, count, batch.data.data() + batch.samples);
+        batch.samples += count;
+        offset += count;
+        if (batch.samples == batch.data.size())
+            FlushAecBatch(track_index);
     }
+}
+
+void DebugTrace::FlushAecBatch(size_t track) {
+    static constexpr const char* names[] = {"aec_mic", "aec_ref", "aec_out"};
+    auto& batch = (*aec_batches_)[track];
+    if (batch.samples == 0)
+        return;
+    Queue(11 + track, names[track], "", reinterpret_cast<const uint8_t*>(batch.data.data()),
+          batch.samples * sizeof(int16_t), 16000, 0, 0, 0, "", batch.start_us, batch.index);
+    batch.samples = 0;
 }
 
 void DebugTrace::Queue(uint16_t kind, const char* type, const char* detail, const uint8_t* payload,
@@ -230,7 +275,7 @@ void DebugTrace::Queue(uint16_t kind, const char* type, const char* detail, cons
     cJSON_free(json);
     if (length)
         frame.insert(frame.end(), payload, payload + length);
-    if (queued_bytes_ + frame.size() > kMaxQueuedBytes) {
+    if (kind != 3 && queued_bytes_ + frame.size() > kMaxQueuedBytes - kCloseReserveBytes) {
         cJSON_ReplaceItemInObjectCaseSensitive(meta, "event_type", cJSON_CreateString("trace_gap"));
         if (cJSON_GetObjectItemCaseSensitive(meta, "detail")) {
             cJSON_ReplaceItemInObjectCaseSensitive(meta, "detail",
@@ -254,7 +299,8 @@ void DebugTrace::Queue(uint16_t kind, const char* type, const char* detail, cons
         Write32(frame, meta_length);
         frame.insert(frame.end(), json, json + meta_length);
         cJSON_free(json);
-        while (queued_bytes_ + frame.size() > kMaxQueuedBytes && !queue_.empty()) {
+        while (queued_bytes_ + frame.size() > kMaxQueuedBytes - kCloseReserveBytes &&
+               !queue_.empty()) {
             queued_bytes_ -= queue_.front().size;
             queue_.pop_front();
         }
@@ -275,6 +321,8 @@ void DebugTrace::Queue(uint16_t kind, const char* type, const char* detail, cons
     std::memcpy(stored.bytes.get(), frame.data(), frame.size());
     queued_bytes_ += stored.size;
     queue_.push_back(std::move(stored));
+    if (kind == 3)
+        trace_id_.clear();
 }
 
 bool DebugTrace::SendFrame(int socket, const uint8_t* frame, size_t size) {
@@ -308,6 +356,8 @@ void DebugTrace::Run() {
         }
         timeval timeout{.tv_sec = 2, .tv_usec = 0};
         setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+        int no_delay = 1;
+        setsockopt(socket, IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(no_delay));
         if (connect(socket, reinterpret_cast<sockaddr*>(&destination), sizeof(destination)) == 0) {
             cJSON* meta = cJSON_CreateObject();
             cJSON_AddStringToObject(meta, "boot_id", boot_id_.c_str());
@@ -325,21 +375,29 @@ void DebugTrace::Run() {
                 hello.insert(hello.end(), json, json + size);
                 cJSON_free(json);
                 if (SendFrame(socket, hello.data(), hello.size())) {
+                    std::vector<uint8_t> batch;
+                    batch.reserve(kSendBatchSize);
                     for (;;) {
-                        Frame frame;
+                        batch.clear();
                         {
                             std::lock_guard<std::mutex> lock(mutex_);
-                            if (!queue_.empty()) {
-                                frame = std::move(queue_.front());
+                            // Send already queued frames together. Hundreds of
+                            // small PCM writes otherwise compete with the live
+                            // cloud stream and delayed TCP acknowledgements.
+                            while (!queue_.empty() &&
+                                   batch.size() + queue_.front().size <= kSendBatchSize) {
+                                const auto& frame = queue_.front();
+                                batch.insert(batch.end(), frame.bytes.get(),
+                                             frame.bytes.get() + frame.size);
                                 queued_bytes_ -= frame.size;
                                 queue_.pop_front();
                             }
                         }
-                        if (!frame.bytes) {
+                        if (batch.empty()) {
                             vTaskDelay(pdMS_TO_TICKS(30));
                             continue;
                         }
-                        const bool sent = SendFrame(socket, frame.bytes.get(), frame.size);
+                        const bool sent = SendFrame(socket, batch.data(), batch.size());
                         if (!sent)
                             break;
                     }

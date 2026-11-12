@@ -31,7 +31,7 @@ Run `go test ./...` for the collector's host tests. Validate it with a device by
 For a manual smoke check without hardware, start the collector and run `node scripts/send-sample.mjs 127.0.0.1 7319`. Open the browser page and inspect the sample session, JSON payload, uplink WAV, and ZIP export. This script sends a synthetic trace; it does not contact Aliyun.
 ## AEC diagnostics
 
-On the Waveshare 3.5B software AEC build, trace level 2 records `aec_mic`,
+On the Waveshare 3.5B software AEC build, dedicated `/api/test/pcm` tests at trace level 2 record `aec_mic`,
 `aec_ref`, and `aec_out` as 16 kHz mono PCM. The collector stores each track in
 its own `pcm-*.dat` file and exposes WAV segments through the existing audio
 endpoint. `GET /api/sessions/{id}/aec-report` returns sample continuity,
@@ -108,3 +108,43 @@ gain; the manifest records both. Original captures are retained. The combined
 file plays the entire raw capture, one second of silence, then the entire AEC
 output, preserving the startup interval. Local tests do not prove cloud VAD,
 continuous upload during speaking, or response cancellation.
+
+### Conversation mode and Realtime integration
+
+With device debug capture enabled, `POST /api/test/chat?action=cycle|click|stop`
+queues the same application mode-cycle/single-click actions as the board button,
+or ends a conversation. The endpoint rejects requests when debug is disabled.
+`GET /api/test/stats` reports the current `mode`, `state`, and AEC enable state
+on software-AEC builds. Physical single/double-click recognition still needs a
+button test; the HTTP action cannot validate debouncing.
+
+Prepare two local PCM WAV files: a request for a long reply and an interruption
+request. The computer speaker should be beside the device. Run on Windows:
+
+```powershell
+python tools/realtime-debug/scripts/realtime_test.py --mode realtime `
+  --question question.wav --interrupt interrupt.wav --output tmp-realtime-test
+```
+
+The runner waits for actual device playback before playing the interruption,
+ends the session, waits for the trace to close, and exports event timing,
+resource snapshots, computer speech markers and audio tracks. Markers include
+the estimated device time and the clock synchronization uncertainty.
+It rejects incomplete traces and verifies cloud speech-start events and continued
+upload. Inspect the saved transcript and timing for false interruptions and
+recognition accuracy; these assertions alone do not certify usable full duplex.
+The current assertion expects exactly two cloud speech-start events. A real
+interruption split into several turns can fail this check, while an echo-triggered
+stop before the computer speech starts can escape it. Review the speech markers,
+playback and cancellation timing, transcripts, and subsequent replies together;
+a successful script exit is not an acceptance result for Realtime interruption.
+`--mode manual` or `--mode auto` without `--interrupt` exercises turn-taking.
+
+At capture level 2, audio-bearing WebSocket JSON is omitted in favor of PCM
+tracks; other cloud events remain available. Level 1 retains the raw WebSocket
+audio messages. Playback PCM records samples submitted locally, not both received
+downlink and submitted output. Live conversations record uplink (the processed
+microphone signal) and playback, keeping diagnostic traffic below a simultaneous
+five-track capture. Dedicated AEC tests additionally record mic/reference/output
+in 64 ms batches, including the final partial batch. Compare the two test profiles
+separately; live conversation recordings alone cannot quantify echo suppression.

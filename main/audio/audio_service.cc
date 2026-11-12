@@ -333,6 +333,8 @@ void AudioService::AudioInputTask() {
 }
 
 void AudioService::AudioOutputTask() {
+    std::vector<int16_t> output_chunk;
+    output_chunk.reserve(std::max(1, codec_->output_sample_rate() / 50));
     while (true) {
         std::unique_lock<std::mutex> lock(audio_queue_mutex_);
         audio_queue_cv_.wait(
@@ -354,26 +356,41 @@ void AudioService::AudioOutputTask() {
             codec_->EnableOutput(true);
         }
 
-        bool current_playback = false;
-        {
-            std::lock_guard<std::mutex> reference_lock(audio_queue_mutex_);
-            current_playback = generation == playback_generation_ && !service_stopped_.load();
-            if (current_playback && audio_engine_initialized_) {
-#if CONFIG_WAVESHARE_3_5B_SOFTWARE_AEC
-                DebugTrace::Instance().Pcm(false, reinterpret_cast<const uint8_t*>(task.pcm.data()),
-                                           task.pcm.size() * sizeof(int16_t),
-                                           codec_->output_sample_rate());
-#endif
-                audio_engine_->FeedPlaybackReference(task.pcm.data(), task.pcm.size(),
-                                                     codec_->output_sample_rate(),
-                                                     esp_timer_get_time());
+        // Limit an uncancellable codec write to 20 ms. References describe only
+        // chunks actually submitted, including the final DMA tail after abort.
+        const size_t chunk_samples = std::max(1, codec_->output_sample_rate() / 50);
+        for (size_t offset = 0; offset < task.pcm.size(); offset += chunk_samples) {
+            const size_t count = std::min(chunk_samples, task.pcm.size() - offset);
+            output_chunk.assign(task.pcm.begin() + offset, task.pcm.begin() + offset + count);
+            bool current_playback = false;
+            {
+                std::lock_guard<std::mutex> reference_lock(audio_queue_mutex_);
+                current_playback = generation == playback_generation_ && !service_stopped_.load();
+                if (current_playback && audio_engine_initialized_) {
+                    audio_engine_->PreparePlayback();
+                    audio_engine_->FeedPlaybackReference(output_chunk.data(), output_chunk.size(),
+                                                         codec_->output_sample_rate(),
+                                                         esp_timer_get_time());
+                }
             }
-        }
-        if (current_playback) {
-            if (task.playback_id != 0 && callbacks_.on_playback_progress) {
+            if (!current_playback) {
+                break;
+            }
+            if (offset == 0 && task.playback_id != 0 && callbacks_.on_playback_progress) {
                 callbacks_.on_playback_progress(task.playback_id, task.media_position_ms);
             }
-            codec_->OutputData(task.pcm);
+            codec_->OutputData(output_chunk);
+#if CONFIG_WAVESHARE_3_5B_SOFTWARE_AEC
+            // Record after the codec accepted the chunk. The diagnostic runner
+            // uses this track as the first reliable indication that audio has
+            // reached the device playback path.
+            DebugTrace::Instance().Pcm(false, reinterpret_cast<const uint8_t*>(output_chunk.data()),
+                                       output_chunk.size() * sizeof(int16_t),
+                                       codec_->output_sample_rate());
+#endif
+            if (audio_engine_initialized_) {
+                audio_engine_->PreparePlayback();
+            }
         }
 
         /* Update the last output time */
@@ -528,9 +545,11 @@ void AudioService::OpusCodecTask() {
                 std::memcpy(packet->payload.data(), task.pcm.data(), packet->payload.size());
                 {
                     std::lock_guard<std::mutex> lock2(audio_queue_mutex_);
-                    if (audio_send_queue_.full())
-                        audio_send_queue_.pop_front();
-                    audio_send_queue_.push_back(std::move(packet));
+                    if (task.generation == capture_generation_) {
+                        if (audio_send_queue_.full())
+                            audio_send_queue_.pop_front();
+                        audio_send_queue_.push_back(std::move(packet));
+                    }
                 }
                 if (callbacks_.on_send_queue_available)
                     callbacks_.on_send_queue_available();
@@ -554,10 +573,12 @@ void AudioService::OpusCodecTask() {
                             std::lock_guard<std::mutex> lock2(audio_queue_mutex_);
                             /* Never let a full send queue stall encoding: stale realtime
                              * audio is useless to the server, so drop the oldest packet. */
-                            if (audio_send_queue_.size() >= MAX_SEND_PACKETS_IN_QUEUE) {
-                                audio_send_queue_.pop_front();
+                            if (task.generation == capture_generation_) {
+                                if (audio_send_queue_.size() >= MAX_SEND_PACKETS_IN_QUEUE) {
+                                    audio_send_queue_.pop_front();
+                                }
+                                audio_send_queue_.push_back(std::move(packet));
                             }
-                            audio_send_queue_.push_back(std::move(packet));
                         }
                         if (callbacks_.on_send_queue_available) {
                             callbacks_.on_send_queue_available();
@@ -644,6 +665,9 @@ void AudioService::PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t
     {
         /* Push the task to the encode queue */
         std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+        if (type == kAudioTaskTypeEncodeToSendQueue && !uplink_enabled_.load())
+            return;
+        task.generation = capture_generation_;
 
         /* If the task is to send queue, we need to set the timestamp */
         if (type == kAudioTaskTypeEncodeToSendQueue && !timestamp_queue_.empty()) {
@@ -692,6 +716,9 @@ bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> pa
         return false;
     }
     playback_drained_notified_ = false;
+    if (audio_engine_initialized_) {
+        audio_engine_->PreparePlayback();
+    }
     audio_decode_queue_.push_back(std::move(packet));
     audio_queue_cv_.notify_all();
     return true;
@@ -783,8 +810,18 @@ void AudioService::EnableVoiceProcessing(bool enable) {
     ESP_LOGD(TAG, "%s voice processing", enable ? "Enabling" : "Disabling");
 
     if (enable) {
+        if (uplink_enabled_.load() && IsAudioProcessorRunning()) {
+            return;
+        }
         if (!InitializeAudioEngine()) {
             return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+            ++capture_generation_;
+            audio_encode_queue_.clear();
+            audio_send_queue_.clear();
+            audio_queue_cv_.notify_all();
         }
         ResetDecoder();
         audio_input_need_warmup_ = true;
@@ -806,12 +843,25 @@ void AudioService::EnableVoiceProcessing(bool enable) {
     }
 }
 
+bool AudioService::SupportsRealtime() const {
+    return codec_ != nullptr && codec_->duplex() && audio_engine_initialized_ &&
+           audio_engine_->HasAecReference();
+}
+
+void AudioService::ConfigureConversationAec(bool realtime) {
+    if (InitializeAudioEngine()) {
+        audio_engine_->SetPlaybackAecOnly(true);
+        EnableDeviceAec(realtime);
+    }
+}
+
 void AudioService::EnableAecMonitoring(int delay_ms) {
 #if CONFIG_WAVESHARE_3_5B_SOFTWARE_AEC
     uplink_enabled_.store(false);
     if (!InitializeAudioEngine()) {
         return;
     }
+    audio_engine_->SetPlaybackAecOnly(false);
     audio_engine_->SetPlaybackReferenceDelay(delay_ms < 0 ? CONFIG_WAVESHARE_3_5B_AEC_DELAY_MS
                                                           : delay_ms);
     audio_engine_->ResetPlaybackReference();
@@ -884,12 +934,12 @@ bool AudioService::IsPlaybackIdle() {
     return IsPlaybackDrainedLocked();
 }
 
-void AudioService::ResetDecoder() {
+void AudioService::ResetDecoder(bool reset_reference) {
     bool notify_drained = false;
     {
         std::lock_guard<std::mutex> lock(audio_queue_mutex_);
         ++playback_generation_;
-        if (audio_engine_initialized_) {
+        if (reset_reference && audio_engine_initialized_) {
             audio_engine_->ResetPlaybackReference();
         }
         std::unique_lock<std::mutex> decoder_lock(decoder_mutex_);

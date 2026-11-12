@@ -196,7 +196,8 @@ void Application::Run() {
         MAIN_EVENT_VAD_CHANGE | MAIN_EVENT_CLOCK_TICK | MAIN_EVENT_ERROR |
         MAIN_EVENT_NETWORK_CONNECTED | MAIN_EVENT_NETWORK_DISCONNECTED | MAIN_EVENT_TOGGLE_CHAT |
         MAIN_EVENT_START_LISTENING | MAIN_EVENT_STOP_LISTENING | MAIN_EVENT_ACTIVATION_DONE |
-        MAIN_EVENT_STATE_CHANGED | MAIN_EVENT_PLAYBACK_DRAINED | MAIN_EVENT_STARTUP_HINT_TIMEOUT;
+        MAIN_EVENT_STATE_CHANGED | MAIN_EVENT_PLAYBACK_DRAINED | MAIN_EVENT_STARTUP_HINT_TIMEOUT |
+        MAIN_EVENT_CYCLE_LISTENING_MODE;
 
     while (true) {
         auto bits = xEventGroupWaitBits(event_group_, ALL_EVENTS, pdTRUE, pdFALSE, portMAX_DELAY);
@@ -248,7 +249,9 @@ void Application::Run() {
             }
         }
 
-        if (bits & MAIN_EVENT_TOGGLE_CHAT) {
+        if (bits & MAIN_EVENT_CYCLE_LISTENING_MODE) {
+            HandleCycleListeningModeEvent();
+        } else if (bits & MAIN_EVENT_TOGGLE_CHAT) {
             HandleToggleChatEvent();
         }
 
@@ -261,7 +264,13 @@ void Application::Run() {
         }
 
         if (bits & MAIN_EVENT_SEND_AUDIO) {
-            while (auto packet = audio_service_.PopPacketFromSendQueue()) {
+            // Continuous Realtime capture must not monopolize event dispatch.
+            int sent = 0;
+            while (sent < 4) {
+                auto packet = audio_service_.PopPacketFromSendQueue();
+                if (!packet)
+                    break;
+                ++sent;
                 if (protocol_ && !protocol_->SendAudio(std::move(packet))) {
                     // Drop the remaining packets. Leaving them in the queue would
                     // stall the Opus codec task (it waits for queue space), which in
@@ -272,6 +281,8 @@ void Application::Run() {
                     break;
                 }
             }
+            if (sent == 4)
+                xEventGroupSetBits(event_group_, MAIN_EVENT_SEND_AUDIO);
         }
 
         if (bits & MAIN_EVENT_WAKE_WORD_DETECTED) {
@@ -643,8 +654,14 @@ void Application::InitializeProtocol() {
     protocol_->OnAudioChannelClosed([this, &board]() {
         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
         Schedule([this]() {
+            if (protocol_ && protocol_->IsAudioChannelOpened())
+                return;
             auto display = Board::GetInstance().GetDisplay();
             display->SetChatMessage("system", "");
+            audio_service_.ResetDecoder(false);
+#if CONFIG_ALIYUN_REALTIME
+            aliyun_response_done_ = false;
+#endif
             SetDeviceState(kDeviceStateIdle);
         });
     });
@@ -797,8 +814,10 @@ void Application::InitializeProtocol() {
 #if CONFIG_ALIYUN_REALTIME
     if (aliyun_mode_) {
         auto* aliyun = static_cast<AliyunProtocol*>(protocol_.get());
-        aliyun->OnResponseStarted([this]() {
-            Schedule([this]() {
+        aliyun->OnResponseStarted([this, aliyun](uint64_t token) {
+            Schedule([this, aliyun, token]() {
+                if (protocol_.get() != aliyun || !aliyun->IsCurrentResponse(token))
+                    return;
                 aliyun_response_done_ = false;
                 if (GetDeviceState() == kDeviceStateListening ||
                     GetDeviceState() == kDeviceStateIdle) {
@@ -806,8 +825,10 @@ void Application::InitializeProtocol() {
                 }
             });
         });
-        aliyun->OnResponseDone([this]() {
-            Schedule([this]() {
+        aliyun->OnResponseDone([this, aliyun](uint64_t token) {
+            Schedule([this, aliyun, token]() {
+                if (protocol_.get() != aliyun || !aliyun->IsCurrentResponse(token))
+                    return;
                 aliyun_response_done_ = true;
                 if (GetDeviceState() == kDeviceStateSpeaking && audio_service_.IsPlaybackIdle()) {
                     aliyun_response_done_ = false;
@@ -817,8 +838,23 @@ void Application::InitializeProtocol() {
                 }
             });
         });
-        aliyun->OnTranscript([this, display](bool user, const std::string& text) {
-            Schedule([display, user, text]() {
+        aliyun->OnSpeechStarted([this, aliyun](uint64_t token) {
+            // Called under the protocol's reply lock before any newer audio
+            // can arrive. Keep the reference of samples already in TX DMA.
+            audio_service_.ResetDecoder(false);
+            Schedule([this, aliyun, token]() {
+                if (protocol_.get() != aliyun || !aliyun->IsCurrentResponse(token))
+                    return;
+                aliyun_response_done_ = false;
+                if (GetDeviceState() == kDeviceStateSpeaking)
+                    SetDeviceState(kDeviceStateListening);
+            });
+        });
+        aliyun->OnTranscript([this, display, aliyun](bool user, const std::string& text) {
+            const auto generation = aliyun->connection_generation();
+            Schedule([this, display, aliyun, generation, user, text]() {
+                if (protocol_.get() != aliyun || generation != aliyun->connection_generation())
+                    return;
                 display->SetChatMessage(user ? "user" : "assistant", text.c_str());
             });
         });
@@ -876,6 +912,96 @@ void Application::DismissAlert() {
 
 void Application::ToggleChatState() { xEventGroupSetBits(event_group_, MAIN_EVENT_TOGGLE_CHAT); }
 
+void Application::CycleListeningMode() {
+    xEventGroupSetBits(event_group_, MAIN_EVENT_CYCLE_LISTENING_MODE);
+}
+
+void Application::EndConversation() {
+    Schedule([this]() {
+        const auto state = GetDeviceState();
+        if (state != kDeviceStateConnecting && state != kDeviceStateListening &&
+            state != kDeviceStateSpeaking)
+            return;
+        pending_listening_start_ = false;
+        play_popup_on_listening_ = false;
+        audio_service_.EnableVoiceProcessing(false);
+        if (protocol_)
+            protocol_->CloseAudioChannel();
+        audio_service_.ResetDecoder(false);
+#if CONFIG_ALIYUN_REALTIME
+        aliyun_response_done_ = false;
+#endif
+        SetDeviceState(kDeviceStateIdle);
+    });
+}
+
+bool Application::SupportsRealtimeMode() const {
+    if (audio_service_.SupportsRealtime())
+        return true;
+#if CONFIG_ALIYUN_REALTIME
+    if (aliyun_mode_)
+        return false;
+#endif
+    return aec_mode_ == kAecOnServerSide;
+}
+
+void Application::HandleCycleListeningModeEvent() {
+    const auto state = GetDeviceState();
+    if (!protocol_ || (state != kDeviceStateIdle && state != kDeviceStateConnecting &&
+                       state != kDeviceStateListening && state != kDeviceStateSpeaking))
+        return;
+    const auto current = GetDefaultListeningMode();
+    preferred_listening_mode_ = current == kListeningModeManualStop ? kListeningModeAutoStop
+                                : current == kListeningModeAutoStop && SupportsRealtimeMode()
+                                    ? kListeningModeRealtime
+                                    : kListeningModeManualStop;
+    listening_mode_selected_ = true;
+    pending_listening_start_ = false;
+    play_popup_on_listening_ = false;
+    audio_service_.EnableVoiceProcessing(false);
+    if (protocol_->IsAudioChannelOpened())
+        protocol_->CloseAudioChannel();
+    audio_service_.ResetDecoder(false);
+#if CONFIG_ALIYUN_REALTIME
+    aliyun_response_done_ = false;
+#endif
+    SetDeviceState(kDeviceStateIdle);
+    UpdateConversationStatus();
+}
+
+void Application::UpdateConversationStatus() {
+    const auto mode =
+        GetDeviceState() == kDeviceStateIdle || GetDeviceState() == kDeviceStateConnecting
+            ? GetDefaultListeningMode()
+            : listening_mode_;
+    displayed_listening_mode_.store(mode);
+    const char* name = mode == kListeningModeManualStop ? "Manual"
+                       : mode == kListeningModeRealtime ? "Realtime"
+                                                        : "Auto";
+    const char* state = nullptr;
+    switch (GetDeviceState()) {
+        case kDeviceStateIdle:
+            if (!last_error_message_.empty())
+                return;
+            break;
+        case kDeviceStateConnecting:
+            state = Lang::Strings::CONNECTING;
+            break;
+        case kDeviceStateListening:
+            state = Lang::Strings::LISTENING;
+            break;
+        case kDeviceStateSpeaking:
+            state = Lang::Strings::SPEAKING;
+            break;
+        default:
+            return;
+    }
+    std::string status = name;
+    if (state)
+        status += std::string(" | ") + state;
+    Board::GetInstance().GetDisplay()->SetStatus(status.c_str());
+}
+
 void Application::StartListening() { xEventGroupSetBits(event_group_, MAIN_EVENT_START_LISTENING); }
 
 void Application::StopListening() { xEventGroupSetBits(event_group_, MAIN_EVENT_STOP_LISTENING); }
@@ -908,6 +1034,7 @@ void Application::HandleToggleChatEvent() {
 
     if (state == kDeviceStateIdle) {
         ListeningMode mode = GetDefaultListeningMode();
+        listening_mode_ = mode;
         if (!protocol_->IsAudioChannelOpened()) {
             SetDeviceState(kDeviceStateConnecting);
             // Schedule to let the state change be processed first (UI update)
@@ -918,7 +1045,10 @@ void Application::HandleToggleChatEvent() {
     } else if (state == kDeviceStateSpeaking) {
         AbortSpeaking(kAbortReasonNone);
     } else if (state == kDeviceStateListening) {
-        protocol_->CloseAudioChannel();
+        if (listening_mode_ == kListeningModeManualStop)
+            HandleStopListeningEvent();
+        else
+            protocol_->CloseAudioChannel();
     }
 }
 
@@ -1126,26 +1256,32 @@ void Application::HandleStateChangedEvent() {
             // queues STATE_CHANGED after Alert(), and the idle handler would
             // otherwise wipe the status, emotion, and chat message.
             if (last_error_message_.empty()) {
-                display->SetStatus(Lang::Strings::STANDBY);
+                UpdateConversationStatus();
                 display->ClearChatMessages();  // Clear messages first
                 display->SetEmotion(
                     "neutral");  // Then set emotion (wechat mode checks child count)
             }
             audio_service_.EnableVoiceProcessing(false);
+            if (listening_mode_selected_
+#if CONFIG_ALIYUN_REALTIME
+                || aliyun_mode_
+#endif
+            )
+                audio_service_.ConfigureConversationAec(false);
             audio_service_.EnableWakeWordDetection(true);
             break;
         case kDeviceStateConnecting:
-            display->SetStatus(Lang::Strings::CONNECTING);
+            UpdateConversationStatus();
             display->SetEmotion("neutral");
             display->SetChatMessage("system", "");
             break;
         case kDeviceStateListening:
-            display->SetStatus(Lang::Strings::LISTENING);
+            UpdateConversationStatus();
             display->SetEmotion("neutral");
 
             // Make sure the audio processor is running
             if (play_popup_on_listening_ || !audio_service_.IsAudioProcessorRunning()
-#if CONFIG_WAVESHARE_3_5B_SOFTWARE_AEC
+#if CONFIG_ALIYUN_REALTIME
                 || aliyun_mode_
 #endif
             ) {
@@ -1163,12 +1299,16 @@ void Application::HandleStateChangedEvent() {
             }
             break;
         case kDeviceStateSpeaking:
-            display->SetStatus(Lang::Strings::SPEAKING);
+            UpdateConversationStatus();
 
-#if CONFIG_WAVESHARE_3_5B_SOFTWARE_AEC
+#if CONFIG_ALIYUN_REALTIME
             if (aliyun_mode_) {
-                audio_service_.EnableAecMonitoring();
-                audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
+                if (listening_mode_ == kListeningModeRealtime) {
+                    audio_service_.EnableWakeWordDetection(false);
+                } else {
+                    audio_service_.EnableVoiceProcessing(false);
+                    audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
+                }
                 break;
             }
 #endif
@@ -1273,6 +1413,13 @@ void Application::StartListeningAudio() {
     }
 
     // Send the start listening command
+    if (listening_mode_selected_
+#if CONFIG_ALIYUN_REALTIME
+        || aliyun_mode_
+#endif
+    )
+        audio_service_.ConfigureConversationAec(listening_mode_ == kListeningModeRealtime &&
+                                                aec_mode_ != kAecOnServerSide);
     protocol_->SendStartListening(listening_mode_);
     audio_service_.EnableVoiceProcessing(true);
 
@@ -1286,6 +1433,12 @@ void Application::StartListeningAudio() {
 }
 
 void Application::ConfigureWakeWordForListening() {
+#if CONFIG_ALIYUN_REALTIME
+    if (aliyun_mode_ && listening_mode_ == kListeningModeRealtime) {
+        audio_service_.EnableWakeWordDetection(false);
+        return;
+    }
+#endif
 #ifdef CONFIG_WAKE_WORD_DETECTION_IN_LISTENING
     // Enable wake word detection in listening mode (configured via Kconfig)
     audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
@@ -1375,6 +1528,14 @@ void Application::AbortSpeaking(AbortReason reason) {
     if (protocol_) {
         protocol_->SendAbortSpeaking(reason);
     }
+#if CONFIG_ALIYUN_REALTIME
+    if (aliyun_mode_) {
+        audio_service_.ResetDecoder(false);
+        aliyun_response_done_ = false;
+        SetDeviceState(listening_mode_ == kListeningModeManualStop ? kDeviceStateIdle
+                                                                   : kDeviceStateListening);
+    }
+#endif
 }
 
 void Application::SetListeningMode(ListeningMode mode) {
@@ -1383,6 +1544,8 @@ void Application::SetListeningMode(ListeningMode mode) {
 }
 
 ListeningMode Application::GetDefaultListeningMode() const {
+    if (listening_mode_selected_)
+        return preferred_listening_mode_;
 #if CONFIG_ALIYUN_REALTIME
     if (aliyun_mode_)
         return kListeningModeAutoStop;
