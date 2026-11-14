@@ -219,6 +219,7 @@ private:
     FixedQueue<uint32_t, MAX_TIMESTAMPS_IN_QUEUE> timestamp_queue_;
 
     std::atomic<bool> audio_engine_initialized_{false};
+    bool audio_testing_trace_open_ = false;
     bool voice_detected_ = false;
 #if CONFIG_USE_DEVICE_AEC || CONFIG_WAVESHARE_3_5B_SOFTWARE_AEC
     bool device_aec_enabled_ = true;

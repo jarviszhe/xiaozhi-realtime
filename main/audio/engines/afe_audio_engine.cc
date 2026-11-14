@@ -10,6 +10,7 @@
 
 #include <esp_heap_caps.h>
 #include <esp_log.h>
+#include <esp_nsn_models.h>
 #include <esp_timer.h>
 #include <esp_vadn_models.h>
 
@@ -187,10 +188,22 @@ bool AfeAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms,
     // the Waveshare ES8311 reference path. Aggressive is the best measured
     // compromise between echo suppression and interruption detection.
     afe_config->aec_nlp_level = AEC_NLP_LEVEL_AGGR;
-    // Request SE as configured; ESP-SR may disable it for single-mic layouts.
-    // No NSNet model is loaded, so ns_init remains false.
-    afe_config->se_init = CONFIG_WAVESHARE_3_5B_AEC_NS;
-    afe_config->ns_init = false;
+    // SE is microphone-array processing. Single-mic noise suppression must
+    // enable NS explicitly, using the selected backend and packaged model.
+    afe_config->se_init = false;
+    afe_config->ns_init = CONFIG_WAVESHARE_3_5B_AEC_NS;
+    afe_config->ns_model_name = nullptr;
+    afe_config->afe_ns_mode = AFE_NS_MODE_WEBRTC;
+#if CONFIG_WAVESHARE_3_5B_AEC_NS && CONFIG_SR_NSN_NSNET2
+    afe_config->ns_model_name =
+        models_ == nullptr ? nullptr : esp_srmodel_filter(models_, ESP_NSNET_PREFIX, nullptr);
+    if (afe_config->ns_model_name == nullptr) {
+        ESP_LOGE(TAG, "NSNet2 selected but missing from speech assets");
+        afe_config_free(afe_config);
+        return false;
+    }
+    afe_config->afe_ns_mode = AFE_NS_MODE_NET;
+#endif
     afe_config->vad_init = kUseAfeForVoiceProcessing;
     afe_config->vad_mode = VAD_MODE_0;
     afe_config->vad_min_noise_ms = 100;
@@ -240,6 +253,9 @@ bool AfeAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms,
     }
     afe_config->agc_init = false;
     afe_config->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
+    const std::string ns_backend = !afe_config->ns_init        ? "off"
+                                   : afe_config->ns_model_name ? afe_config->ns_model_name
+                                                               : "WebRTC";
 
     ESP_LOGI(TAG, "Before AFE create: free=%u min=%u largest=%u",
              heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
@@ -315,10 +331,9 @@ bool AfeAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms,
     const char* detector = wake_detector_ == WakeDetector::kWakeNet
                                ? "WakeNet"
                                : (wake_detector_ == WakeDetector::kMultiNet ? "MultiNet" : "none");
-    ESP_LOGI(
-        TAG, "Initialized FD AFE, detector: %s, SE requested: %s, NSNet: off, feed: %d, fetch: %d",
-        detector, CONFIG_WAVESHARE_3_5B_AEC_NS ? "yes (see pipeline for actual support)" : "no",
-        afe_iface_->get_feed_chunksize(afe_data_), afe_iface_->get_fetch_chunksize(afe_data_));
+    ESP_LOGI(TAG, "Initialized FD AFE, detector: %s, NS requested: %s, feed: %d, fetch: %d",
+             detector, ns_backend.c_str(), afe_iface_->get_feed_chunksize(afe_data_),
+             afe_iface_->get_fetch_chunksize(afe_data_));
     ESP_LOGI(TAG, "After AFE create: free=%u min=%u largest=%u",
              heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),

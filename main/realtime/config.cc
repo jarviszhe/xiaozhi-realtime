@@ -102,6 +102,8 @@ AliyunRealtimeConfig LoadAliyunRealtimeConfig() {
     config.debug_address = ReadString(handle, "dbg_addr");
     nvs_get_i32(handle, "dbg_level", &level);
     config.debug_level = level;
+    nvs_get_u8(handle, "dbg_input", &enabled);
+    config.debug_input_pcm = enabled != 0;
     nvs_close(handle);
     return config;
 }
@@ -151,6 +153,8 @@ bool SaveAliyunRealtimeConfig(const AliyunRealtimeConfig& config) {
         result = nvs_set_str(handle, "dbg_addr", config.debug_address.c_str());
     if (result == ESP_OK)
         result = nvs_set_i32(handle, "dbg_level", config.debug_level);
+    if (result == ESP_OK)
+        result = nvs_set_u8(handle, "dbg_input", config.debug_input_pcm ? 1 : 0);
     if (result == ESP_OK)
         result = nvs_commit(handle);
     nvs_close(handle);

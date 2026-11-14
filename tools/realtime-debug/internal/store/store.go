@@ -72,6 +72,7 @@ type session struct {
 	payloads *os.File
 	uplink   *os.File
 	playback *os.File
+	input    *os.File
 	aecMic   *os.File
 	aecRef   *os.File
 	aecOut   *os.File
@@ -129,7 +130,7 @@ func (s *Store) recoverSession(entry *session) error {
 	reader := bufio.NewReaderSize(file, 64*1024)
 	var offset int64
 	var ended bool
-	ends := map[string]int64{"payloads.dat": 0, "pcm-uplink.dat": 0, "pcm-playback.dat": 0, "pcm-aec_mic.dat": 0, "pcm-aec_ref.dat": 0, "pcm-aec_out.dat": 0}
+	ends := map[string]int64{"payloads.dat": 0, "pcm-uplink.dat": 0, "pcm-playback.dat": 0, "pcm-input.dat": 0, "pcm-aec_mic.dat": 0, "pcm-aec_ref.dat": 0, "pcm-aec_out.dat": 0}
 	entry.summary.Events = 0
 	entry.summary.Gaps = 0
 	entry.summary.Bytes = 0
@@ -179,7 +180,7 @@ func (s *Store) recoverSession(entry *session) error {
 		path := filepath.Join(entry.dir, name)
 		info, err := os.Stat(path)
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) && end == 0 && (name == "pcm-aec_mic.dat" || name == "pcm-aec_ref.dat" || name == "pcm-aec_out.dat") {
+			if errors.Is(err, os.ErrNotExist) && end == 0 && (name == "pcm-input.dat" || name == "pcm-aec_mic.dat" || name == "pcm-aec_ref.dat" || name == "pcm-aec_out.dat") {
 				continue
 			}
 			return err
@@ -249,7 +250,7 @@ func (s *Store) openFiles(entry *session) error {
 	files := []struct {
 		name string
 		dest **os.File
-	}{{"events.jsonl", &entry.events}, {"payloads.dat", &entry.payloads}, {"pcm-uplink.dat", &entry.uplink}, {"pcm-playback.dat", &entry.playback}, {"pcm-aec_mic.dat", &entry.aecMic}, {"pcm-aec_ref.dat", &entry.aecRef}, {"pcm-aec_out.dat", &entry.aecOut}}
+	}{{"events.jsonl", &entry.events}, {"payloads.dat", &entry.payloads}, {"pcm-uplink.dat", &entry.uplink}, {"pcm-playback.dat", &entry.playback}, {"pcm-input.dat", &entry.input}, {"pcm-aec_mic.dat", &entry.aecMic}, {"pcm-aec_ref.dat", &entry.aecRef}, {"pcm-aec_out.dat", &entry.aecOut}}
 	for _, item := range files {
 		file, err := openAppend(filepath.Join(entry.dir, item.name))
 		if err != nil {
@@ -262,12 +263,12 @@ func (s *Store) openFiles(entry *session) error {
 }
 
 func (entry *session) closeFiles() {
-	for _, file := range []*os.File{entry.events, entry.payloads, entry.uplink, entry.playback, entry.aecMic, entry.aecRef, entry.aecOut} {
+	for _, file := range []*os.File{entry.events, entry.payloads, entry.uplink, entry.playback, entry.input, entry.aecMic, entry.aecRef, entry.aecOut} {
 		if file != nil {
 			file.Close()
 		}
 	}
-	entry.events, entry.payloads, entry.uplink, entry.playback, entry.aecMic, entry.aecRef, entry.aecOut = nil, nil, nil, nil, nil, nil, nil
+	entry.events, entry.payloads, entry.uplink, entry.playback, entry.input, entry.aecMic, entry.aecRef, entry.aecOut = nil, nil, nil, nil, nil, nil, nil, nil
 }
 
 func (s *Store) writeManifest(entry *session) error {
@@ -298,7 +299,7 @@ func appendBytes(file *os.File, payload []byte) (int64, error) {
 
 func audioFilename(track string) string {
 	switch track {
-	case "uplink", "playback", "aec_mic", "aec_ref", "aec_out":
+	case "uplink", "playback", "input", "aec_mic", "aec_ref", "aec_out":
 		return "pcm-" + track + ".dat"
 	default:
 		return ""
@@ -317,12 +318,14 @@ func (s *Store) Append(frame trace.Frame) (string, error) {
 	}
 	event := Event{Kind: trace.KindName(frame.Kind), Meta: frame.Meta, RawMeta: frame.RawMeta, ReceivedAt: time.Now().UTC()}
 	var payloadFile *os.File
-	if frame.Kind == trace.PCMUplink || frame.Kind == trace.PCMPlayback || frame.Kind == trace.AECMic || frame.Kind == trace.AECRef || frame.Kind == trace.AECOut {
+	if frame.Kind == trace.PCMUplink || frame.Kind == trace.PCMPlayback || frame.Kind == trace.AECMic || frame.Kind == trace.AECRef || frame.Kind == trace.AECOut || frame.Kind == trace.PCMInput {
 		switch frame.Kind {
 		case trace.PCMUplink:
 			payloadFile, event.AudioTrack = entry.uplink, "uplink"
 		case trace.PCMPlayback:
 			payloadFile, event.AudioTrack = entry.playback, "playback"
+		case trace.PCMInput:
+			payloadFile, event.AudioTrack = entry.input, "input"
 		case trace.AECMic:
 			payloadFile, event.AudioTrack = entry.aecMic, "aec_mic"
 		case trace.AECRef:
@@ -625,10 +628,10 @@ func (s *Store) Export(id string, output io.Writer) error {
 		return err
 	}
 	archive := zip.NewWriter(output)
-	for _, name := range []string{"manifest.json", "events.jsonl", "payloads.dat", "pcm-uplink.dat", "pcm-playback.dat", "pcm-aec_mic.dat", "pcm-aec_ref.dat", "pcm-aec_out.dat"} {
+	for _, name := range []string{"manifest.json", "events.jsonl", "payloads.dat", "pcm-uplink.dat", "pcm-playback.dat", "pcm-input.dat", "pcm-aec_mic.dat", "pcm-aec_ref.dat", "pcm-aec_out.dat"} {
 		file, err := os.Open(filepath.Join(dir, name))
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) && (name == "pcm-aec_mic.dat" || name == "pcm-aec_ref.dat" || name == "pcm-aec_out.dat") {
+			if errors.Is(err, os.ErrNotExist) && (name == "pcm-input.dat" || name == "pcm-aec_mic.dat" || name == "pcm-aec_ref.dat" || name == "pcm-aec_out.dat") {
 				continue
 			}
 			archive.Close()

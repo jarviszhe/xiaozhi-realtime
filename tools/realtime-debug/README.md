@@ -163,6 +163,11 @@ volume and restores it after stopping, including on setup/run failures. This
 uses the codec's persistent volume setter, so check `result.json` for restoration
 errors. Other diagnostic choices last until changed or the device restarts.
 
+With matching firmware and debug enabled, `POST /api/test/chat?action=volume-80`
+sets the speaker volume through the existing codec settings. Values must be
+integers from 1 to 100 and the device must be idle. HTTP 202 means queued; verify
+`output_volume` in `/api/test/stats`. This setting persists across reboots.
+
 At capture level 2, audio-bearing WebSocket JSON is omitted in favor of PCM
 tracks; other cloud events remain available. Level 1 retains the raw WebSocket
 audio messages. Playback PCM records samples submitted locally, not both received

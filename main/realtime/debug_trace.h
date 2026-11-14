@@ -25,6 +25,7 @@ public:
     void WebSocketTx(const char* data, size_t length, bool success, bool audio = false);
     void WebSocketRx(const char* data, size_t length, bool audio = false);
     void Pcm(bool uplink, const uint8_t* data, size_t length, int sample_rate);
+    void PcmInput(const int16_t* data, size_t samples, int channels, int sample_rate);
     void AecPcm(const char* track, const int16_t* data, size_t samples, int64_t sample_start_us,
                 uint64_t sample_index);
 
@@ -49,7 +50,7 @@ private:
     void Queue(uint16_t kind, const char* type, const char* detail, const uint8_t* payload,
                size_t length, int sample_rate = 0, int part_index = 0, int part_count = 0,
                size_t total_length = 0, const char* message_id = "", int64_t sample_start_us = 0,
-               uint64_t sample_index = 0);
+               uint64_t sample_index = 0, int channels = 1);
     bool SendFrame(int socket, const uint8_t* frame, size_t size);
 
     std::mutex mutex_;
@@ -57,6 +58,7 @@ private:
     std::unique_ptr<std::array<AecBatch, 3>> aec_batches_;
     std::atomic<bool> capture_aec_{false};
     std::atomic<bool> conversation_aec_capture_{false};
+    std::atomic<bool> capture_input_pcm_{false};
     std::deque<Frame> queue_;
     std::string address_;
     std::string boot_id_;

@@ -18,6 +18,47 @@ SPEC.loader.exec_module(BUILD)
 
 
 class BuildDefaultAssetsTest(unittest.TestCase):
+    def test_nsnet_is_added_to_existing_custom_assets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = root / "nsnet2"
+            model.mkdir()
+            (model / "nsnet2_data").write_bytes(b"NSNet weights")
+            base, output = root / "base.bin", root / "output.bin"
+            base.write_bytes(BUILD.pack_assets_entries({
+                "index.json": (b'{"version":1,"text_font":"font.bin"}', 0, 0),
+                "font.bin": (b"existing UI font", 0, 0),
+            }))
+            BUILD.configure_assets_models(base, output, [], [], nsnet_models=[str(model)])
+            entries = BUILD.read_assets_entries(output)
+            self.assertEqual(entries['font.bin'][0], b"existing UI font")
+            index = json.loads(entries['index.json'][0])
+            self.assertIn(b"NSNet weights", entries[index['srmodels']][0])
+
+    def test_nsnet_only_assets_include_model_weights(self):
+        # Regression: neural NS could be selected but omitted when WakeNet
+        # was disabled, leaving no model for the firmware to load.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = root / "models/nsnet_model/nsnet2"
+            model.mkdir(parents=True)
+            (model / "_MODEL_INFO_").write_bytes(b"nsnet info")
+            (model / "nsnet2_data").write_bytes(b"neural noise suppression weights")
+            config = root / "config"
+            config.write_text("CONFIG_WAKE_WORD_DISABLED=y\nCONFIG_SR_NSN_NSNET2=y\n")
+            output = root / "assets.bin"
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "scripts/build_default_assets.py"),
+                 "--sdkconfig", str(config), "--esp_sr_model_path", str(root / "models"),
+                 "--output", str(output)], text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            entries = BUILD.read_assets_entries(output)
+            index = json.loads(entries["index.json"][0])
+            packed = entries[index["srmodels"]][0]
+            self.assertEqual(struct.unpack_from("<I", packed)[0], 1)
+            self.assertEqual(packed[4:36].rstrip(b"\0"), b"nsnet2")
+            self.assertIn(b"neural noise suppression weights", packed)
+
     def test_text_font_metadata_uses_bundle_charset_size_and_bpp(self):
         with tempfile.TemporaryDirectory() as directory:
             assets = Path(directory)

@@ -29,12 +29,19 @@ removes the matching hint, preserving newer messages and alerts. Disabled or fai
 wake-word detection and startup errors suppress the hint; subsequent idle transitions
 do not repeat it.
 
-The AFE configuration currently uses `FD_LOW_COST` AEC with
-`AEC_NLP_LEVEL_AGGR`. `CONFIG_WAVESHARE_3_5B_AEC_NS` requests speech
-enhancement through `se_init`, but the current ESP-SR pipeline reports that SE
-is disabled for the board's single microphone. This flag does not establish
-working noise suppression. NSNet remains off because this project does not ship
-an NSNet model.
+The AFE configuration uses `FD_LOW_COST` AEC with `AEC_NLP_LEVEL_AGGR`.
+`CONFIG_WAVESHARE_3_5B_AEC_NS` enables single-channel noise suppression through
+`ns_init`; microphone-array SE stays disabled. The Waveshare 3.5B variant selects
+NSNet2, with its model packaged alongside WakeNet in `srmodels.bin`, including
+custom and Emote asset packs. Selecting the WebRTC backend uses the built-in NS
+without a model. AGC remains disabled. Check the printed AFE pipeline and real
+recordings before judging suppression quality.
+
+For ES8311, the official input-gain API changes ADC digital scale in register
+`0x16` (6 dB steps); analog PGA is separately controlled by `0x14[3:0]` (3 dB
+steps). Waveshare's 24 dB input setting leaves the driver's analog PGA at 30 dB.
+Raw codec PCM precedes software NS and can still contain microphone noise;
+listen to `aec_out` or uplink PCM to evaluate the processed signal.
 
 When wake-word audio upload is enabled, the most recent two seconds of PCM are
 stored in a single 64 KB PSRAM ring buffer. WakeNet and MultiNet share the same

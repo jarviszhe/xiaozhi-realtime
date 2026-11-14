@@ -13,7 +13,7 @@ Es8311AudioCodec::Es8311AudioCodec(void* i2c_master_handle, i2c_port_t i2c_port,
                                    int input_sample_rate, int output_sample_rate, gpio_num_t mclk,
                                    gpio_num_t bclk, gpio_num_t ws, gpio_num_t dout, gpio_num_t din,
                                    gpio_num_t pa_pin, uint8_t es8311_addr, bool use_mclk,
-                                   bool pa_inverted, bool input_reference) {
+                                   bool pa_inverted, bool input_reference, float input_gain) {
     duplex_ = true;  // 是否双工
     input_reference_ = input_reference;
     input_channels_ = input_reference_ ? 2 : 1;
@@ -24,7 +24,7 @@ Es8311AudioCodec::Es8311AudioCodec(void* i2c_master_handle, i2c_port_t i2c_port,
     output_sample_rate_ = output_sample_rate;
     pa_pin_ = pa_pin;
     pa_inverted_ = pa_inverted;
-    input_gain_ = 30;
+    input_gain_ = input_gain;
 
     assert(input_sample_rate_ == output_sample_rate_);
     CreateDuplexChannels(mclk, bclk, ws, dout, din);
@@ -186,7 +186,8 @@ void Es8311AudioCodec::SetInputGain(float gain) {
     if (!std::isfinite(gain)) {
         return;
     }
-    // ES8311 microphone PGA steps are 6 dB, from 0 through 42 dB.
+    // The vendor input-gain API controls ADC digital scale (REG16), in 6 dB
+    // steps. The analog PGA is separate: REG14[3:0], 0..30 dB in 3 dB steps.
     gain = std::floor(std::clamp(gain, 0.0f, 42.0f) / 6.0f) * 6.0f;
     std::lock_guard<std::mutex> lock(data_if_mutex_);
     if (dev_ != nullptr) {

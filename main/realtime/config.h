@@ -13,6 +13,7 @@ struct AliyunRealtimeConfig {
     bool debug_enabled = false;
     std::string debug_address;
     int debug_level = 0;
+    bool debug_input_pcm = false;
 
     bool IsReady() const;
     std::string WebSocketUrl() const;

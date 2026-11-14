@@ -335,10 +335,11 @@ public:
             AUDIO_I2S_GPIO_MCLK, AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT,
             AUDIO_I2S_GPIO_DIN, AUDIO_CODEC_PA_PIN, AUDIO_CODEC_ES8311_ADDR, true, false,
 #if CONFIG_WAVESHARE_3_5B_ES8311_REFERENCE
-            true
+            true,
 #else
-            false
+            false,
 #endif
+            24.0f
         );
         return &audio_codec;
     }

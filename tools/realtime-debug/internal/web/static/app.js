@@ -70,14 +70,14 @@ async function selectSession(id) {
 }
 
 function renderAudio(info) {
-  const tracks = [['uplink', '上行 PCM'], ['playback', '播放 PCM'], ['aec_mic', 'AEC 麦克风'], ['aec_ref', 'AEC 参考'], ['aec_out', 'AEC 输出']];
-  const signature = JSON.stringify(tracks.map(([track]) => (info[track] || []).map(segment => [segment.index, segment.length, segment.sample_rate, segment.channels, segment.bits_per_sample])));
+  const tracks = [['input-left', 'input', '原始输入 PCM 左声道试听（重采样前）'], ['input-right', 'input', '原始输入 PCM 右声道试听（重采样前）'], ['uplink', 'uplink', '上行 PCM'], ['playback', 'playback', '播放 PCM'], ['aec_mic', 'aec_mic', 'AEC 麦克风'], ['aec_ref', 'aec_ref', 'AEC 参考'], ['aec_out', 'aec_out', 'AEC 输出']];
+  const signature = JSON.stringify(tracks.map(([, source]) => (info[source] || []).map(segment => [segment.index, segment.length, segment.sample_rate, segment.channels, segment.bits_per_sample])));
   if (signature === state.audioSignature) return;
   state.audioSignature = signature;
   const root = byId('audio-tracks');
   root.replaceChildren();
-  for (const [track, label] of tracks) {
-    for (const segment of info[track] || []) {
+  for (const [track, source, label] of tracks) {
+    for (const segment of info[source] || []) {
       const row = document.createElement('div');
       row.className = 'audio-row';
       const title = document.createElement('span');

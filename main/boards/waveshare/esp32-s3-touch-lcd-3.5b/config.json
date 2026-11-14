@@ -6,6 +6,7 @@
         {
             "name": "esp32-s3-touch-lcd-3.5b",
             "sdkconfig_append": [
+                "CONFIG_SR_NSN_NSNET2=y",
                 "CONFIG_USE_WECHAT_MESSAGE_STYLE=y",
                 "CONFIG_CAMERA_OV2640=y",
                 "CONFIG_CAMERA_OV2640_AUTO_DETECT_DVP_INTERFACE_SENSOR=y",

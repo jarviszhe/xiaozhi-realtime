@@ -1,8 +1,11 @@
 #include "audio_service.h"
 #include <esp_log.h>
 #include <cstring>
-#if CONFIG_WAVESHARE_3_5B_SOFTWARE_AEC
+#if CONFIG_ALIYUN_REALTIME || CONFIG_WAVESHARE_3_5B_SOFTWARE_AEC
 #include "realtime/debug_trace.h"
+#endif
+#if CONFIG_ALIYUN_REALTIME
+#include "realtime/config.h"
 #endif
 
 #define RATE_CVT_CFG(_src_rate, _dest_rate, _channel)                                        \
@@ -128,6 +131,13 @@ void AudioService::Start() {
     esp_timer_start_periodic(audio_power_timer_, 1000000);
 
 #if CONFIG_USE_AUDIO_PROCESSOR
+#if CONFIG_IDF_TARGET_ESP32S3 && CONFIG_SR_NSN_NSNET2 && !CONFIG_FREERTOS_UNICORE
+    // FD AEC and neural NS run synchronously in Feed(). Use the second core
+    // to avoid competing with the Wi-Fi task during full-duplex streaming.
+    constexpr BaseType_t input_task_core = 1;
+#else
+    constexpr BaseType_t input_task_core = 0;
+#endif
     /* Start the audio input task */
     xTaskCreatePinnedToCore(
         [](void* arg) {
@@ -135,7 +145,7 @@ void AudioService::Start() {
             audio_service->AudioInputTask();
             vTaskDelete(NULL);
         },
-        "audio_input", 2048 * 3, this, 8, &audio_input_task_handle_, 0);
+        "audio_input", 2048 * 3, this, 8, &audio_input_task_handle_, input_task_core);
 
     /* Start the audio output task */
     xTaskCreate(
@@ -214,6 +224,14 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
         if (!codec_->InputData(data)) {
             return false;
         }
+
+#if CONFIG_ALIYUN_REALTIME
+        // Capture the samples exactly as returned by the codec (for example,
+        // ES8311) before any device-side sample-rate conversion.
+        DebugTrace::Instance().PcmInput(data.data(), data.size() / codec_->input_channels(),
+                                        codec_->input_channels(), codec_->input_sample_rate());
+#endif
+
         if (input_resampler_ != nullptr) {
             std::lock_guard<std::mutex> lock(input_resampler_mutex_);
             uint32_t in_sample_num = data.size() / codec_->input_channels();
@@ -232,6 +250,13 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
         if (!codec_->InputData(data)) {
             return false;
         }
+
+#if CONFIG_ALIYUN_REALTIME
+        // This path is already at the codec's native rate, so the captured
+        // samples are also the direct codec output.
+        DebugTrace::Instance().PcmInput(data.data(), data.size() / codec_->input_channels(),
+                                        codec_->input_channels(), codec_->input_sample_rate());
+#endif
     }
 
     /* Update the last input time */
@@ -919,6 +944,14 @@ void AudioService::EnableAecMonitoring(int delay_ms) {
 void AudioService::EnableAudioTesting(bool enable) {
     ESP_LOGI(TAG, "%s audio testing", enable ? "Enabling" : "Disabling");
     if (enable) {
+#if CONFIG_ALIYUN_REALTIME
+        const auto config = LoadAliyunRealtimeConfig();
+        if (config.debug_input_pcm && !audio_testing_trace_open_) {
+            DebugTrace::Instance().Configure(config);
+            DebugTrace::Instance().Open("audio_testing");
+            audio_testing_trace_open_ = true;
+        }
+#endif
         xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING);
     } else {
         xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING);
@@ -930,6 +963,12 @@ void AudioService::EnableAudioTesting(bool enable) {
             playback_drained_notified_ = false;
         }
         audio_queue_cv_.notify_all();
+#if CONFIG_ALIYUN_REALTIME
+        if (audio_testing_trace_open_) {
+            DebugTrace::Instance().Close();
+            audio_testing_trace_open_ = false;
+        }
+#endif
     }
 }
 

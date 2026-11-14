@@ -28,6 +28,7 @@ const (
 	AECMic      = 11
 	AECRef      = 12
 	AECOut      = 13
+	PCMInput    = 14
 )
 
 var kindNames = map[uint16]string{
@@ -36,6 +37,7 @@ var kindNames = map[uint16]string{
 	WSRX: "ws_rx", PCMPlayback: "pcm_playback", LocalEvent: "local_event",
 	TraceGap: "trace_gap",
 	AECMic:   "aec_mic", AECRef: "aec_ref", AECOut: "aec_out",
+	PCMInput: "pcm_input",
 }
 
 type Meta struct {
@@ -132,7 +134,7 @@ func ReadFrame(r io.Reader) (Frame, error) {
 			return Frame{}, errors.New("metadata field too long")
 		}
 	}
-	if kind == PCMUplink || kind == PCMPlayback || kind == AECMic || kind == AECRef || kind == AECOut {
+	if kind == PCMUplink || kind == PCMPlayback || kind == AECMic || kind == AECRef || kind == AECOut || kind == PCMInput {
 		if meta.SampleRate <= 0 || meta.SampleRate > 192000 || meta.Channels < 1 || meta.Channels > 8 ||
 			(meta.BitsPerSample != 16 && meta.BitsPerSample != 24 && meta.BitsPerSample != 32) ||
 			meta.ByteOrder != "little" || meta.SampleFormat != "signed_int" {

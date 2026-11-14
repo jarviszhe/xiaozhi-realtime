@@ -22,7 +22,9 @@
 namespace {
 constexpr char kTag[] = "RealtimeTrace";
 #if CONFIG_SPIRAM_USE_MALLOC
-constexpr size_t kMaxQueuedBytes = 512 * 1024;
+// Full AEC diagnostics plus raw stereo PCM can exceed 200 KB/s. Keep a
+// bounded PSRAM buffer for short Wi-Fi stalls without blocking audio tasks.
+constexpr size_t kMaxQueuedBytes = 1024 * 1024;
 #else
 constexpr size_t kMaxQueuedBytes = 128 * 1024;
 #endif
@@ -61,10 +63,9 @@ DebugTrace& DebugTrace::Instance() {
 }
 
 void DebugTrace::Configure(const AliyunRealtimeConfig& config) {
-    // Proxy mode already records the complete WebSocket exchange on the Go
-    // side. Keep the legacy TCP trace disabled there so its extra traffic
-    // cannot perturb the realtime connection.
-    if (!config.debug_enabled || !config.websocket_url.empty() ||
+    // Proxy mode records the WebSocket exchange on the Go side. Enable the
+    // device trace there only when raw input PCM capture was requested.
+    if (!config.debug_enabled || (!config.websocket_url.empty() && !config.debug_input_pcm) ||
         !ValidateAliyunRealtimeConfig(config))
         return;
     {
@@ -74,6 +75,7 @@ void DebugTrace::Configure(const AliyunRealtimeConfig& config) {
         enabled_ = true;
         level_ = config.debug_level;
         address_ = config.debug_address;
+        capture_input_pcm_.store(config.debug_input_pcm && config.debug_level >= 2);
         started_ = true;
     }
     if (xTaskCreate(RunTask, "rt_trace", kTaskStackBytes, this, 2, nullptr) != pdPASS) {
@@ -169,6 +171,25 @@ void DebugTrace::Pcm(bool uplink, const uint8_t* data, size_t length, int sample
     }
 }
 
+void DebugTrace::PcmInput(const int16_t* data, size_t samples, int channels, int sample_rate) {
+    if (!enabled_ || level_ < 2 || !capture_input_pcm_.load() || data == nullptr || samples == 0 ||
+        channels < 1 || channels > 8) {
+        return;
+    }
+    const size_t length = samples * static_cast<size_t>(channels) * sizeof(int16_t);
+    for (size_t offset = 0; offset < length;) {
+        size_t chunk = std::min(kChunkSize, length - offset);
+        const size_t frame_bytes = static_cast<size_t>(channels) * sizeof(int16_t);
+        chunk -= chunk % frame_bytes;
+        if (chunk == 0) {
+            break;
+        }
+        Queue(14, "pcm_input", "", reinterpret_cast<const uint8_t*>(data) + offset, chunk,
+              sample_rate, 0, 0, 0, "", 0, 0, channels);
+        offset += chunk;
+    }
+}
+
 void DebugTrace::AecPcm(const char* track, const int16_t* data, size_t samples,
                         int64_t sample_start_us, uint64_t sample_index) {
     if (!enabled_ || level_ < 2 || !capture_aec_.load() || data == nullptr || samples == 0 ||
@@ -220,7 +241,7 @@ void DebugTrace::FlushAecBatch(size_t track) {
 void DebugTrace::Queue(uint16_t kind, const char* type, const char* detail, const uint8_t* payload,
                        size_t length, int sample_rate, int part_index, int part_count,
                        size_t total_length, const char* message_id, int64_t sample_start_us,
-                       uint64_t sample_index) {
+                       uint64_t sample_index, int channels) {
     if (length > kChunkSize)
         return;
     std::lock_guard<std::mutex> lock(mutex_);
@@ -249,7 +270,7 @@ void DebugTrace::Queue(uint16_t kind, const char* type, const char* detail, cons
     }
     if (sample_rate > 0) {
         cJSON_AddNumberToObject(meta, "sample_rate", sample_rate);
-        cJSON_AddNumberToObject(meta, "channels", 1);
+        cJSON_AddNumberToObject(meta, "channels", channels);
         cJSON_AddNumberToObject(meta, "bits_per_sample", 16);
         cJSON_AddStringToObject(meta, "sample_format", "signed_int");
         cJSON_AddStringToObject(meta, "byte_order", "little");

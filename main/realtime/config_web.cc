@@ -146,6 +146,20 @@ esp_err_t PostTestChat(httpd_req_t* request) {
         if (app.GetDeviceState() != kDeviceStateIdle)
             return Reply(request, "409 Conflict", "{\"error\":\"audio_busy\"}");
         app.SetAecMode(strcmp(action, "aec-on") == 0 ? kAecOnDeviceSide : kAecOnServerSide);
+    } else if (strncmp(action, "volume-", 7) == 0) {
+        const char* value = action + 7;
+        if (value[0] == '\0')
+            return Reply(request, "400 Bad Request", "{\"error\":\"invalid_volume\"}");
+        for (const char* digit = value; *digit != '\0'; ++digit) {
+            if (*digit < '0' || *digit > '9')
+                return Reply(request, "400 Bad Request", "{\"error\":\"invalid_volume\"}");
+        }
+        const int volume = std::atoi(value);
+        if (volume < 1 || volume > 100)
+            return Reply(request, "400 Bad Request", "{\"error\":\"invalid_volume\"}");
+        if (app.GetDeviceState() != kDeviceStateIdle)
+            return Reply(request, "409 Conflict", "{\"error\":\"audio_busy\"}");
+        app.Schedule([volume]() { Board::GetInstance().GetAudioCodec()->SetOutputVolume(volume); });
     } else
         return Reply(request, "400 Bad Request", "{\"error\":\"invalid_action\"}");
     return Reply(request, "202 Accepted", "{\"queued\":true}");
@@ -164,6 +178,7 @@ esp_err_t GetConfig(httpd_req_t* request) {
     cJSON_AddBoolToObject(root, "debug_enabled", config.debug_enabled);
     cJSON_AddStringToObject(root, "debug_address", config.debug_address.c_str());
     cJSON_AddNumberToObject(root, "debug_level", config.debug_level);
+    cJSON_AddBoolToObject(root, "debug_input_pcm", config.debug_input_pcm);
     char* json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (!json)
@@ -211,7 +226,9 @@ esp_err_t PutConfig(httpd_req_t* request) {
     auto config = LoadAliyunRealtimeConfig();
     bool clear_key = false;
     const cJSON* level = cJSON_GetObjectItemCaseSensitive(root, "debug_level");
+    const cJSON* input_pcm = cJSON_GetObjectItemCaseSensitive(root, "debug_input_pcm");
     const cJSON* key = cJSON_GetObjectItemCaseSensitive(root, "api_key");
+    const bool input_pcm_valid = input_pcm == nullptr || cJSON_IsBool(input_pcm);
     bool valid = ReadBool(root, "selected", config.selected) &&
                  ReadString(root, "region", config.region) &&
                  ReadString(root, "workspace_id", config.workspace_id) &&
@@ -219,9 +236,12 @@ esp_err_t PutConfig(httpd_req_t* request) {
                  ReadBool(root, "debug_enabled", config.debug_enabled) &&
                  ReadString(root, "debug_address", config.debug_address) &&
                  ReadBool(root, "clear_api_key", clear_key) && cJSON_IsNumber(level) &&
-                 level->valuedouble == level->valueint && cJSON_IsString(key);
+                 level->valuedouble == level->valueint && input_pcm_valid && cJSON_IsString(key);
     if (valid) {
         config.debug_level = level->valueint;
+        if (input_pcm != nullptr) {
+            config.debug_input_pcm = cJSON_IsTrue(input_pcm);
+        }
         if (clear_key)
             config.api_key.clear();
         else if (key->valuestring[0] != '\0')

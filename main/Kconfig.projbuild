@@ -45,11 +45,11 @@ config WAVESHARE_3_5B_ES8311_REFERENCE
         Disable to use the existing software copy of submitted playback PCM.
 
 config WAVESHARE_3_5B_AEC_NS
-    bool "Enable WebRTC noise suppression with Waveshare 3.5B AEC"
+    bool "Enable noise suppression with Waveshare 3.5B AEC"
     default y
     depends on WAVESHARE_3_5B_SOFTWARE_AEC
     help
-        Run the built-in WebRTC noise suppression stage after AEC. This reduces
+        Run the selected ESP-SR noise suppression stage after AEC. This reduces
         stationary microphone and room noise, but may affect soft speech and
         increases AFE CPU and memory use. Validate with near-only and double-talk
         recordings before releasing.

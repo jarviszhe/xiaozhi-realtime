@@ -4,10 +4,12 @@ import (
 	"embed"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -87,6 +89,11 @@ func (s *Server) session(w http.ResponseWriter, r *http.Request) {
 			fail(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		input, err := s.store.Segments(id, "input")
+		if err != nil {
+			fail(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 		mic, err := s.store.Segments(id, "aec_mic")
 		if err != nil {
 			fail(w, http.StatusInternalServerError, err.Error())
@@ -102,7 +109,7 @@ func (s *Server) session(w http.ResponseWriter, r *http.Request) {
 			fail(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		jsonResponse(w, map[string]any{"summary": summary, "uplink": uplink, "playback": playback, "aec_mic": mic, "aec_ref": ref, "aec_out": out})
+		jsonResponse(w, map[string]any{"summary": summary, "uplink": uplink, "playback": playback, "input": input, "aec_mic": mic, "aec_ref": ref, "aec_out": out})
 		return
 	}
 	switch parts[1] {
@@ -177,33 +184,109 @@ func (s *Server) audio(w http.ResponseWriter, r *http.Request, id string, parts 
 		return
 	}
 	track := parts[2]
+	sourceTrack := track
+	channel := -1
+	if track == "input-left" {
+		sourceTrack = "input"
+		channel = 0
+	} else if track == "input-right" {
+		sourceTrack = "input"
+		channel = 1
+	}
 	index, err := strconv.Atoi(strings.TrimSuffix(parts[3], ".wav"))
 	if err != nil {
 		fail(w, http.StatusBadRequest, "invalid audio segment")
 		return
 	}
-	segments, err := s.store.Segments(id, track)
+	segments, err := s.store.Segments(id, sourceTrack)
 	if err != nil || index < 0 || index >= len(segments) {
 		fail(w, http.StatusNotFound, "audio segment not found")
 		return
 	}
 	segment := segments[index]
+	if channel >= segment.Channels {
+		fail(w, http.StatusNotFound, "audio channel not found")
+		return
+	}
 	if segment.Length < 0 || segment.Length > 0xffffffff-36 {
 		fail(w, http.StatusRequestEntityTooLarge, "WAV segment too large")
 		return
 	}
-	file, err := s.store.OpenAudio(id, track)
+	file, err := s.store.OpenAudio(id, sourceTrack)
 	if err != nil {
 		fail(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	defer file.Close()
+	channelAudio := channel >= 0 && segment.Channels > 1
+	if channelAudio {
+		segment.Channels = 1
+		segment.Length /= int64(segments[index].Channels)
+	}
 	w.Header().Set("Content-Type", "audio/wav")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Length", strconv.FormatInt(segment.Length+44, 10))
-	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", track+"-"+strconv.Itoa(index)+".wav"))
+	filename := track + "-" + strconv.Itoa(index)
+	if channelAudio {
+		if channel == 0 {
+			filename += "-left"
+		} else {
+			filename += "-right"
+		}
+	}
+	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", filename+".wav"))
 	w.Write(wavHeader(segment))
+	if channelAudio {
+		if err := copyChannel(w, file, segments[index], channel); err != nil {
+			return
+		}
+		return
+	}
 	io.Copy(w, io.NewSectionReader(file, segment.Offset, segment.Length))
+}
+
+func copyChannel(dst io.Writer, file *os.File, segment store.Segment, channel int) error {
+	if segment.Channels < 2 || segment.BitsPerSample%8 != 0 {
+		return errors.New("unsupported channel layout")
+	}
+	if channel < 0 || channel >= segment.Channels {
+		return errors.New("invalid channel")
+	}
+	sampleBytes := segment.BitsPerSample / 8
+	frameBytes := segment.Channels * sampleBytes
+	if frameBytes <= 0 || segment.Length%int64(frameBytes) != 0 {
+		return errors.New("unaligned PCM segment")
+	}
+	const bufferSize = 8192
+	readSize := bufferSize - bufferSize%frameBytes
+	input := make([]byte, readSize)
+	output := make([]byte, readSize/frameBytes*sampleBytes)
+	reader := io.NewSectionReader(file, segment.Offset, segment.Length)
+	remaining := segment.Length
+	for remaining > 0 {
+		count := int64(len(input))
+		if count > remaining {
+			count = remaining
+		}
+		count -= count % int64(frameBytes)
+		if count == 0 {
+			return errors.New("unaligned PCM read")
+		}
+		n, err := io.ReadFull(reader, input[:count])
+		if err != nil {
+			return err
+		}
+		frames := n / frameBytes
+		for i := 0; i < frames; i++ {
+			inputOffset := i*frameBytes + channel*sampleBytes
+			copy(output[i*sampleBytes:(i+1)*sampleBytes], input[inputOffset:inputOffset+sampleBytes])
+		}
+		if _, err := dst.Write(output[:frames*sampleBytes]); err != nil {
+			return err
+		}
+		remaining -= int64(n)
+	}
+	return nil
 }
 
 func wavHeader(segment store.Segment) []byte {
