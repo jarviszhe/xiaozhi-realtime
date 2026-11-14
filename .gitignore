@@ -18,3 +18,37 @@ main/mmap_generate_emoji.h
 *.bin
 mmap_generate_*.h
 .clangd
+
+# Local ESP32/AEC and Realtime debug artifacts
+/aec-boot.log
+/board-list.json
+/device-boot*.log
+/device_boot*.log
+/events.json
+/probe.pcm
+/probe.wav
+/proxy.err
+/proxy.log
+/request*.wav
+/wake.wav
+/tmp-aec-*/
+/tmp-current-aec-*/
+/tmp-proxy-data/
+/tmp-realtime-*/
+/tmp_aec_*
+/tools/realtime-debug/realtime-debug.exe*
+/tools/realtime-debug/tools/
+/docs/datasheet/ESP32-S3-Touch-LCD-3.5B-Schematic.pdf
+
+# Local investigation notes; commit design documents explicitly when needed.
+/design/aliyun-realtime-design.md
+/design/aliyun-realtime-full-duplex-plan.md
+/design/aliyun-realtime-implementation.md
+/design/aliyun-realtime-requirements.md
+/design/flash-capacity.md
+/design/waveshare-3.5b-aec-issues-2026-11-12.md
+/design/waveshare-3.5b-aec-optimization-and-resources-2026-11-12.md
+/design/waveshare-3.5b-aec-progress-2026-11-11.md
+/design/waveshare-3.5b-aec-progress-2026-11-12.md
+/design/waveshare-3.5b-aec-reference-optimization-2026-11-12.md
+/design/waveshare-3.5b-software-aec.md
