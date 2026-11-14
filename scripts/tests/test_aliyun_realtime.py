@@ -186,6 +186,7 @@ class AliyunRealtimeTests(unittest.TestCase):
         source = (ROOT / "main/application.cc").read_text(encoding="utf-8")
         methods = []
         for signature in ["bool Application::SupportsRealtimeMode() const",
+                          "void Application::EndConversation()",
                           "void Application::HandleCycleListeningModeEvent()",
                           "void Application::UpdateConversationStatus()",
                           "void Application::HandleToggleChatEvent()",
@@ -244,6 +245,7 @@ class AliyunRealtimeTests(unittest.TestCase):
                 void ContinueOpenAudioChannel(ListeningMode m){SetListeningMode(m);}
                 void Schedule(std::function<void()> f){f();}
                 bool SupportsRealtimeMode()const;
+                void EndConversation();
                 void HandleCycleListeningModeEvent();void UpdateConversationStatus();void HandleToggleChatEvent();
                 ListeningMode GetDefaultListeningMode()const;
             };
@@ -267,6 +269,15 @@ class AliyunRealtimeTests(unittest.TestCase):
                 a.UpdateConversationStatus();assert(display->status=="Error");
                 a.aliyun_mode_=false;a.listening_mode_selected_=false;a.aec_mode_=kAecOnServerSide;
                 assert(a.SupportsRealtimeMode());
+                // A finished Manual reply is idle but still owns an open channel.
+                a.state=kDeviceStateIdle;a.protocol_->opened=true;
+                auto closes=a.protocol_->closes;
+                a.EndConversation();
+                assert(!a.protocol_->opened && a.protocol_->closes==closes+1);
+                assert(a.state==kDeviceStateIdle && !a.audio_service_.reset_reference);
+                a.state=kDeviceStateStarting;a.protocol_->opened=true;
+                closes=a.protocol_->closes;a.EndConversation();
+                assert(a.protocol_->opened && a.protocol_->closes==closes);
             }
         '''
         with tempfile.TemporaryDirectory() as folder:

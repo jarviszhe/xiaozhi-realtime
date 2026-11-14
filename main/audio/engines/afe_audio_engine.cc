@@ -81,6 +81,10 @@ bool AfeAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms,
     output_buffer_.reserve(frame_samples_);
 
 #if CONFIG_WAVESHARE_3_5B_SOFTWARE_AEC
+    if (codec_->input_reference() && codec_->input_channels() == 2) {
+        microphone_trace_.reserve(160);
+        aligned_reference_.reserve(160);
+    }
     if (codec_->input_channels() == 1 && !codec_->input_reference() &&
         codec_->output_sample_rate() == 24000) {
         reference_ring_ = static_cast<int16_t*>(
@@ -179,7 +183,10 @@ bool AfeAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms,
 
     afe_config->aec_init = ref_num > 0;
     afe_config->aec_mode = AEC_MODE_FD_LOW_COST;
-    afe_config->aec_nlp_level = AEC_NLP_LEVEL_VERYAGGR;
+    // Very aggressive NLP suppresses near-end speech during double-talk on
+    // the Waveshare ES8311 reference path. Aggressive is the best measured
+    // compromise between echo suppression and interruption detection.
+    afe_config->aec_nlp_level = AEC_NLP_LEVEL_AGGR;
     // Request SE as configured; ESP-SR may disable it for single-mic layouts.
     // No NSNet model is loaded, so ns_init remains false.
     afe_config->se_init = CONFIG_WAVESHARE_3_5B_AEC_NS;
@@ -308,9 +315,10 @@ bool AfeAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms,
     const char* detector = wake_detector_ == WakeDetector::kWakeNet
                                ? "WakeNet"
                                : (wake_detector_ == WakeDetector::kMultiNet ? "MultiNet" : "none");
-    ESP_LOGI(TAG, "Initialized FD AFE, detector: %s, NS: %s, feed: %d, fetch: %d", detector,
-             CONFIG_WAVESHARE_3_5B_AEC_NS ? "webrtc" : "off",
-             afe_iface_->get_feed_chunksize(afe_data_), afe_iface_->get_fetch_chunksize(afe_data_));
+    ESP_LOGI(
+        TAG, "Initialized FD AFE, detector: %s, SE requested: %s, NSNet: off, feed: %d, fetch: %d",
+        detector, CONFIG_WAVESHARE_3_5B_AEC_NS ? "yes (see pipeline for actual support)" : "no",
+        afe_iface_->get_feed_chunksize(afe_data_), afe_iface_->get_fetch_chunksize(afe_data_));
     ESP_LOGI(TAG, "After AFE create: free=%u min=%u largest=%u",
              heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
@@ -397,6 +405,30 @@ void AfeAudioEngine::Feed(std::vector<int16_t>&& data) {
             interleaved_input_[2 * i] = data[i];
             interleaved_input_[2 * i + 1] = aligned_reference_[i];
         }
+    } else if (codec_->input_reference() && codec_->input_channels() == 2) {
+        std::lock_guard<std::mutex> reference_lock(reference_mutex_);
+        const size_t samples = data.size() / 2;
+        const int64_t observed_start_us =
+            esp_timer_get_time() - static_cast<int64_t>(samples) * 1000000 / 16000;
+        int64_t start_us =
+            input_origin_us_.load() + static_cast<int64_t>(input_sample_index_) * 1000000 / 16000;
+        if (input_origin_us_.load() == 0 || observed_start_us < start_us - 20000 ||
+            observed_start_us > start_us + 100000) {
+            start_us = observed_start_us;
+            input_origin_us_.store(start_us -
+                                   static_cast<int64_t>(input_sample_index_) * 1000000 / 16000);
+        }
+        microphone_trace_.resize(samples);
+        aligned_reference_.resize(samples);
+        for (size_t i = 0; i < samples; ++i) {
+            microphone_trace_[i] = data[2 * i];
+            aligned_reference_[i] = data[2 * i + 1];
+        }
+        DebugTrace::Instance().AecPcm("aec_mic", microphone_trace_.data(), samples, start_us,
+                                      input_sample_index_);
+        DebugTrace::Instance().AecPcm("aec_ref", aligned_reference_.data(), samples, start_us,
+                                      input_sample_index_);
+        input_sample_index_ += samples;
     }
 #endif
 
@@ -481,16 +513,15 @@ void AfeAudioEngine::FeedPlaybackReference(const int16_t* data, size_t samples, 
             max_abs = std::max(max_abs, value);
             sum_squared += static_cast<uint64_t>(value) * static_cast<uint64_t>(value);
         }
-        char detail[96];
-        const unsigned rms = reference_resampled_.empty()
-                                 ? 0
-                                 : static_cast<unsigned>(
-                                       std::sqrt(static_cast<double>(sum_squared) /
-                                                 static_cast<double>(reference_resampled_.size())));
-        std::snprintf(detail, sizeof(detail), "samples=%u max=%d rms=%u",
-                      static_cast<unsigned>(reference_resampled_.size()), max_abs, rms);
-        DebugTrace::Instance().Event("aec_ref_feed_stats", detail);
-        reference_nonzero_logged_ = max_abs > 0;
+        if (max_abs > 0) {
+            char detail[96];
+            const unsigned rms = static_cast<unsigned>(
+                std::sqrt(static_cast<double>(sum_squared) / reference_resampled_.size()));
+            std::snprintf(detail, sizeof(detail), "samples=%u max=%d rms=%u",
+                          static_cast<unsigned>(reference_resampled_.size()), max_abs, rms);
+            DebugTrace::Instance().Event("aec_ref_feed_stats", detail);
+            reference_nonzero_logged_ = true;
+        }
     }
     const int64_t start_us = AdvancePlaybackTimeline(
         output_time_us + static_cast<int64_t>(reference_delay_ms_.load()) * 1000,
@@ -822,7 +853,7 @@ void AfeAudioEngine::HandleVoiceResult(const afe_fetch_result_t* result) {
 
     size_t samples = result->data_size / sizeof(int16_t);
 #if CONFIG_WAVESHARE_3_5B_SOFTWARE_AEC
-    if (software_reference_ready_) {
+    if (software_reference_ready_ || codec_->input_reference()) {
         std::lock_guard<std::mutex> reference_lock(reference_mutex_);
         const int64_t start_us =
             input_origin_us_.load() + static_cast<int64_t>(output_sample_index_) * 1000000 / 16000;

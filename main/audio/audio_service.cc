@@ -189,6 +189,7 @@ void AudioService::Stop() {
     {
         std::lock_guard<std::mutex> lock(audio_queue_mutex_);
         ++playback_generation_;
+        playback_started_ = false;
         audio_encode_queue_.clear();
         audio_decode_queue_.clear();
         audio_playback_queue_.clear();
@@ -333,6 +334,8 @@ void AudioService::AudioInputTask() {
 }
 
 void AudioService::AudioOutputTask() {
+    constexpr size_t kPlaybackPrebufferTasks = MAX_PLAYBACK_TASKS_IN_QUEUE / 2;
+    constexpr auto kPlaybackPrebufferTimeout = std::chrono::milliseconds(250);
     std::vector<int16_t> output_chunk;
     output_chunk.reserve(std::max(1, codec_->output_sample_rate() / 50));
     while (true) {
@@ -342,6 +345,26 @@ void AudioService::AudioOutputTask() {
         if (service_stopped_.load()) {
             break;
         }
+
+        // A response arrives in small network-sized deltas. Wait briefly for
+        // a few decoded tasks before starting a fresh response so one delayed
+        // delta does not turn into an audible gap. Once playback has started,
+        // keep the low-latency behavior for interruptions and later deltas.
+        const auto prebuffer_deadline =
+            std::chrono::steady_clock::now() + kPlaybackPrebufferTimeout;
+        while (!playback_started_ && !audio_playback_queue_.empty() &&
+               audio_playback_queue_.size() < kPlaybackPrebufferTasks && !service_stopped_.load()) {
+            if (audio_queue_cv_.wait_until(lock, prebuffer_deadline) == std::cv_status::timeout) {
+                break;
+            }
+        }
+        if (service_stopped_.load()) {
+            break;
+        }
+        if (audio_playback_queue_.empty()) {
+            continue;
+        }
+        playback_started_ = true;
 
         auto task = std::move(audio_playback_queue_.front());
         audio_playback_queue_.pop_front();
@@ -709,6 +732,17 @@ bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> pa
                        audio_decode_queue_.size() < MAX_DECODE_PACKETS_IN_QUEUE;
             });
         } else {
+            // Realtime network callbacks must never wait for speaker playback.
+            // Drop only this packet; subsequent packets may resume when space
+            // is made by the decoder task.
+            const uint32_t dropped_total = ++debug_statistics_.decode_drop_count;
+            lock.unlock();
+            const int64_t now = esp_timer_get_time();
+            if (now - last_decode_drop_log_time_ >= 1000000) {
+                last_decode_drop_log_time_ = now;
+                ESP_LOGW(TAG, "Decode queue is full, dropping incoming frame (dropped %lu so far)",
+                         (unsigned long)dropped_total);
+            }
             return false;
         }
     }
@@ -716,11 +750,23 @@ bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> pa
         return false;
     }
     playback_drained_notified_ = false;
+    if (!audio_decode_queue_.push_back(std::move(packet))) {
+        const uint32_t dropped_total = ++debug_statistics_.decode_drop_count;
+        audio_queue_cv_.notify_all();
+        lock.unlock();
+        const int64_t now = esp_timer_get_time();
+        if (now - last_decode_drop_log_time_ >= 1000000) {
+            last_decode_drop_log_time_ = now;
+            ESP_LOGW(TAG, "Decode queue is full, dropping incoming frame (dropped %lu so far)",
+                     (unsigned long)dropped_total);
+        }
+        return false;
+    }
     if (audio_engine_initialized_) {
         audio_engine_->PreparePlayback();
     }
-    audio_decode_queue_.push_back(std::move(packet));
     audio_queue_cv_.notify_all();
+    lock.unlock();
     return true;
 }
 
@@ -850,7 +896,7 @@ bool AudioService::SupportsRealtime() const {
 
 void AudioService::ConfigureConversationAec(bool realtime) {
     if (InitializeAudioEngine()) {
-        audio_engine_->SetPlaybackAecOnly(true);
+        audio_engine_->SetPlaybackAecOnly(!realtime);
         EnableDeviceAec(realtime);
     }
 }
@@ -939,6 +985,7 @@ void AudioService::ResetDecoder(bool reset_reference) {
     {
         std::lock_guard<std::mutex> lock(audio_queue_mutex_);
         ++playback_generation_;
+        playback_started_ = false;
         if (reset_reference && audio_engine_initialized_) {
             audio_engine_->ResetPlaybackReference();
         }
@@ -968,6 +1015,7 @@ bool AudioService::MarkPlaybackDrainedLocked() {
     if (!IsPlaybackDrainedLocked() || playback_drained_notified_) {
         return false;
     }
+    playback_started_ = false;
     playback_drained_notified_ = true;
     return true;
 }

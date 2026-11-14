@@ -16,11 +16,12 @@ config ALIYUN_REALTIME
         This first implementation targets the Waveshare ESP32-S3 Touch LCD 3.5B.
 
 config WAVESHARE_3_5B_SOFTWARE_AEC
-    bool "Enable software playback reference AEC on Waveshare 3.5B"
+    bool "Enable playback reference AEC on Waveshare 3.5B"
     default y
     depends on BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5B && USE_AUDIO_PROCESSOR && ALIYUN_REALTIME
     help
-        Feed the ES8311 microphone and a copy of the played PCM to ESP-SR AFE.
+        Feed the ES8311 microphone and a playback reference to ESP-SR AFE.
+        Select the internal DAC reference below, or copy the submitted PCM.
         Acoustic delay and suppression quality require validation on the board.
 
 config WAVESHARE_3_5B_AEC_DELAY_MS
@@ -32,6 +33,16 @@ config WAVESHARE_3_5B_AEC_DELAY_MS
         Additional software delay applied to the submitted playback reference.
         Start at zero so the reference precedes the microphone echo. Tune this
         value using on-device M/R recordings; excessive delay prevents AEC.
+
+config WAVESHARE_3_5B_ES8311_REFERENCE
+    bool "Use ES8311 internal DAC playback reference"
+    default y
+    depends on WAVESHARE_3_5B_SOFTWARE_AEC
+    help
+        Capture the microphone in the left I2S slot and ES8311's internal DAC
+        signal in the right slot. This is a digital reference before the power
+        amplifier and speaker, not an analog loopback after the amplifier.
+        Disable to use the existing software copy of submitted playback PCM.
 
 config WAVESHARE_3_5B_AEC_NS
     bool "Enable WebRTC noise suppression with Waveshare 3.5B AEC"

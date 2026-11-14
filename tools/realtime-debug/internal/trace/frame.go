@@ -50,6 +50,9 @@ type Meta struct {
 	ResponseID           string `json:"response_id,omitempty"`
 	MessageID            string `json:"message_id,omitempty"`
 	EventType            string `json:"event_type,omitempty"`
+	ProxyReceivedAt      string `json:"proxy_received_at,omitempty"`
+	ForwardStartAt       string `json:"forward_start_at,omitempty"`
+	ForwardDoneAt        string `json:"forward_done_at,omitempty"`
 	Detail               string `json:"detail,omitempty"`
 	Mode                 string `json:"mode,omitempty"`
 	ContentType          string `json:"content_type,omitempty"`

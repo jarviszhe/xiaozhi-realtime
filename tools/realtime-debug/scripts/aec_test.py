@@ -225,6 +225,11 @@ def capture(args, pcm, delay, enabled, repetition):
                "analysis": analyze(folder)}
     if reply.get("stats_before") and reply.get("stats_after"):
         summary["resources"] = resource_delta(reply["stats_before"], reply["stats_after"])
+        before = reply["stats_before"]
+        summary["reference_source"] = ("codec_dac" if before.get("codec_reference")
+                                       else "software_pcm")
+        summary["input_gain_db"] = before.get("input_gain_db")
+        summary["output_volume"] = before.get("output_volume")
     (folder / "result.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     if not report["complete"] or report["gaps"] or session["interrupted"]:
         raise RuntimeError(f"Invalid capture saved in {folder}")

@@ -39,8 +39,12 @@
 
 #define OPUS_FRAME_DURATION_MS 60
 #define MAX_ENCODE_TASKS_IN_QUEUE 2
-#define MAX_PLAYBACK_TASKS_IN_QUEUE 2
-#define MAX_DECODE_PACKETS_IN_QUEUE (1200 / OPUS_FRAME_DURATION_MS)
+#define MAX_PLAYBACK_TASKS_IN_QUEUE 8
+// Keep several seconds of compressed/PCM audio available so short network
+// delivery stalls do not immediately empty the speaker queue. Realtime PCM
+// packets are admitted non-blocking and are dropped only while this limit is
+// reached; later packets can resume once playback creates room.
+#define MAX_DECODE_PACKETS_IN_QUEUE (6000 / OPUS_FRAME_DURATION_MS)
 #define MAX_SEND_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
 #define AUDIO_TESTING_MAX_DURATION_MS 10000
 #define MAX_TIMESTAMPS_IN_QUEUE 3
@@ -110,6 +114,7 @@ struct DebugStatistics {
     uint32_t encode_count = 0;
     uint32_t playback_count = 0;
     uint32_t encode_drop_count = 0;
+    uint32_t decode_drop_count = 0;
 };
 
 class AudioService {
@@ -182,6 +187,7 @@ private:
     int decoder_frame_size_ = 0;
     DebugStatistics debug_statistics_;
     int64_t last_encode_drop_log_time_ = 0;
+    int64_t last_decode_drop_log_time_ = 0;
     srmodel_list_t* models_list_ = nullptr;
 
     EventGroupHandle_t event_group_;
@@ -205,6 +211,7 @@ private:
     bool decode_in_flight_ = false;
     bool encode_in_flight_ = false;
     bool output_in_flight_ = false;
+    bool playback_started_ = false;
     bool playback_drained_notified_ = true;
     uint32_t playback_generation_ = 0;
     uint32_t capture_generation_ = 0;

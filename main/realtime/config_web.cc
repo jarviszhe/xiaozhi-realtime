@@ -56,6 +56,14 @@ cJSON* ResourceSnapshot() {
     cJSON_AddNumberToObject(root, "psram_min_since_boot",
                             heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM));
     const auto audio = Application::GetInstance().GetAudioService().GetEngineDiagnostics();
+    cJSON_AddNumberToObject(root, "input_gain_db",
+                            Board::GetInstance().GetAudioCodec()->input_gain());
+    cJSON_AddNumberToObject(root, "output_volume",
+                            Board::GetInstance().GetAudioCodec()->output_volume());
+    cJSON_AddBoolToObject(root, "codec_reference",
+                          Board::GetInstance().GetAudioCodec()->input_reference());
+    cJSON_AddNumberToObject(root, "input_channels",
+                            Board::GetInstance().GetAudioCodec()->input_channels());
     cJSON* engine = cJSON_AddObjectToObject(root, "engine");
     cJSON_AddBoolToObject(engine, "aec_enabled", audio.aec_enabled);
     cJSON_AddNumberToObject(engine, "feed_frames", audio.feed_frames);
@@ -130,7 +138,15 @@ esp_err_t PostTestChat(httpd_req_t* request) {
         app.ToggleChatState();
     else if (strcmp(action, "stop") == 0)
         app.EndConversation();
-    else
+    else if (strcmp(action, "trace-aec") == 0 || strcmp(action, "trace-basic") == 0) {
+        if (app.GetDeviceState() != kDeviceStateIdle)
+            return Reply(request, "409 Conflict", "{\"error\":\"audio_busy\"}");
+        DebugTrace::Instance().SetConversationAecCapture(strcmp(action, "trace-aec") == 0);
+    } else if (strcmp(action, "aec-on") == 0 || strcmp(action, "aec-off") == 0) {
+        if (app.GetDeviceState() != kDeviceStateIdle)
+            return Reply(request, "409 Conflict", "{\"error\":\"audio_busy\"}");
+        app.SetAecMode(strcmp(action, "aec-on") == 0 ? kAecOnDeviceSide : kAecOnServerSide);
+    } else
         return Reply(request, "400 Bad Request", "{\"error\":\"invalid_action\"}");
     return Reply(request, "202 Accepted", "{\"queued\":true}");
 }
@@ -143,6 +159,7 @@ esp_err_t GetConfig(httpd_req_t* request) {
     cJSON_AddBoolToObject(root, "selected", config.selected);
     cJSON_AddStringToObject(root, "region", config.region.c_str());
     cJSON_AddStringToObject(root, "workspace_id", config.workspace_id.c_str());
+    cJSON_AddStringToObject(root, "websocket_url", config.websocket_url.c_str());
     cJSON_AddBoolToObject(root, "api_key_set", !config.api_key.empty());
     cJSON_AddBoolToObject(root, "debug_enabled", config.debug_enabled);
     cJSON_AddStringToObject(root, "debug_address", config.debug_address.c_str());
@@ -198,6 +215,7 @@ esp_err_t PutConfig(httpd_req_t* request) {
     bool valid = ReadBool(root, "selected", config.selected) &&
                  ReadString(root, "region", config.region) &&
                  ReadString(root, "workspace_id", config.workspace_id) &&
+                 ReadString(root, "websocket_url", config.websocket_url) &&
                  ReadBool(root, "debug_enabled", config.debug_enabled) &&
                  ReadString(root, "debug_address", config.debug_address) &&
                  ReadBool(root, "clear_api_key", clear_key) && cJSON_IsNumber(level) &&

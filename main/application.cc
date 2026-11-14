@@ -919,8 +919,10 @@ void Application::CycleListeningMode() {
 void Application::EndConversation() {
     Schedule([this]() {
         const auto state = GetDeviceState();
-        if (state != kDeviceStateConnecting && state != kDeviceStateListening &&
-            state != kDeviceStateSpeaking)
+        // Manual replies return to idle while their channel can remain open.
+        // An explicit stop must close that session and its diagnostic trace too.
+        if (state != kDeviceStateIdle && state != kDeviceStateConnecting &&
+            state != kDeviceStateListening && state != kDeviceStateSpeaking)
             return;
         pending_listening_start_ = false;
         play_popup_on_listening_ = false;

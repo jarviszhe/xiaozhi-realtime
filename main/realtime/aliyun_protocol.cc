@@ -302,7 +302,10 @@ void AliyunProtocol::HandleEvent(const char* data, size_t size, uint32_t generat
                 on_response_started_(ResponseToken());
         }
     } else if (strcmp(type, "response.audio.delta") == 0) {
-        ESP_LOGI(kTag, "PCM delta received");
+        // Audio deltas can arrive several times per second. Keep this at
+        // debug level so normal realtime playback does not spend UART time
+        // formatting and transmitting one log line per audio chunk.
+        ESP_LOGD(kTag, "PCM delta received");
         const char* delta = StringValue(root, "delta");
         const char* id = StringValue(root, "response_id");
         if (delta && response_.Accepts(id) && on_incoming_audio_) {

@@ -18,6 +18,7 @@ public:
     static DebugTrace& Instance();
     void Configure(const AliyunRealtimeConfig& config);
     void Open(const char* mode, bool capture_aec = false);
+    void SetConversationAecCapture(bool enable) { conversation_aec_capture_.store(enable); }
     void SetMode(const char* mode);
     void Close();
     void Event(const char* type, const char* detail = "");
@@ -55,6 +56,7 @@ private:
     std::mutex aec_mutex_;
     std::unique_ptr<std::array<AecBatch, 3>> aec_batches_;
     std::atomic<bool> capture_aec_{false};
+    std::atomic<bool> conversation_aec_capture_{false};
     std::deque<Frame> queue_;
     std::string address_;
     std::string boot_id_;

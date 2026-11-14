@@ -30,7 +30,7 @@ wake-word detection and startup errors suppress the hint; subsequent idle transi
 do not repeat it.
 
 The AFE configuration currently uses `FD_LOW_COST` AEC with
-`AEC_NLP_LEVEL_VERYAGGR`. `CONFIG_WAVESHARE_3_5B_AEC_NS` requests speech
+`AEC_NLP_LEVEL_AGGR`. `CONFIG_WAVESHARE_3_5B_AEC_NS` requests speech
 enhancement through `se_init`, but the current ESP-SR pipeline reports that SE
 is disabled for the board's single microphone. This flag does not establish
 working noise suppression. NSNet remains off because this project does not ship
@@ -50,6 +50,15 @@ Built-in boards default to one microphone: `M` without a playback reference, or
 `MR` when the codec supplies a playback reference. `R` must contain playback
 reference samples, not a second microphone. The channel declaration must match
 the interleaved PCM returned by the codec.
+
+Waveshare 3.5B selects `CONFIG_WAVESHARE_3_5B_ES8311_REFERENCE` by default.
+ES8311 supplies ADC microphone samples in the left slot and its internal DAC
+digital reference in the right slot. Both channels are resampled together from
+24 kHz to 16 kHz and fed as `MR`. The shared codec device uses stereo I/O, so
+mono playback samples are duplicated into the two TX slots while preserving
+playback duration. This reference precedes the amplifier and speaker; it does
+not capture their nonlinear distortion. Disabling the option restores the
+software playback reference. Other boards keep the codec's default mono input.
 
 Multiple-microphone input remains available for developer experiments; the AFE
 still derives its format from the codec's microphone and reference counts.

@@ -113,6 +113,7 @@ private:
     int64_t playback_reference_start_us_ = 0;
     uint64_t playback_reference_samples_ = 0;
     std::vector<int16_t> reference_resampled_;
+    std::vector<int16_t> microphone_trace_;
     std::vector<int16_t> aligned_reference_;
     std::vector<int16_t> interleaved_input_;
     uint64_t input_sample_index_ = 0;

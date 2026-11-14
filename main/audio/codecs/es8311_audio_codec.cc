@@ -1,17 +1,25 @@
 #include "es8311_audio_codec.h"
 
+#include <algorithm>
+#include <cmath>
+
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
 #define TAG "Es8311AudioCodec"
 
-Es8311AudioCodec::Es8311AudioCodec(void* i2c_master_handle, i2c_port_t i2c_port, int input_sample_rate, int output_sample_rate,
-    gpio_num_t mclk, gpio_num_t bclk, gpio_num_t ws, gpio_num_t dout, gpio_num_t din,
-    gpio_num_t pa_pin, uint8_t es8311_addr, bool use_mclk, bool pa_inverted) {
-    duplex_ = true; // 是否双工
-    input_reference_ = false; // 是否使用参考输入，实现回声消除
-    input_channels_ = 1; // 输入通道数
+Es8311AudioCodec::Es8311AudioCodec(void* i2c_master_handle, i2c_port_t i2c_port,
+                                   int input_sample_rate, int output_sample_rate, gpio_num_t mclk,
+                                   gpio_num_t bclk, gpio_num_t ws, gpio_num_t dout, gpio_num_t din,
+                                   gpio_num_t pa_pin, uint8_t es8311_addr, bool use_mclk,
+                                   bool pa_inverted, bool input_reference) {
+    duplex_ = true;  // 是否双工
+    input_reference_ = input_reference;
+    input_channels_ = input_reference_ ? 2 : 1;
+    if (input_reference_) {
+        stereo_output_.reserve(AUDIO_CODEC_DMA_FRAME_NUM * 4);
+    }
     input_sample_rate_ = input_sample_rate;
     output_sample_rate_ = output_sample_rate;
     pa_pin_ = pa_pin;
@@ -52,6 +60,8 @@ Es8311AudioCodec::Es8311AudioCodec(void* i2c_master_handle, i2c_port_t i2c_port,
     es8311_cfg.hw_gain.pa_voltage = 5.0;
     es8311_cfg.hw_gain.codec_dac_voltage = 3.3;
     es8311_cfg.pa_reverted = pa_inverted_;
+    // The vendor driver routes ADC left / DAC reference right (GPIO_REG44=0x58).
+    es8311_cfg.no_dac_ref = false;
     codec_if_ = es8311_codec_new(&es8311_cfg);
 
     if (codec_if_ == nullptr) {
@@ -66,8 +76,8 @@ void Es8311AudioCodec::ResetCodec() {
     // recommended by the initialization guide. Normal codec initialization
     // releases the reset and starts the state machine.
     uint8_t reset_value = 0x1F;
-    ESP_ERROR_CHECK(static_cast<esp_err_t>(
-        ctrl_if_->write_reg(ctrl_if_, 0x00, 1, &reset_value, 1)));
+    ESP_ERROR_CHECK(
+        static_cast<esp_err_t>(ctrl_if_->write_reg(ctrl_if_, 0x00, 1, &reset_value, 1)));
     vTaskDelay(pdMS_TO_TICKS(5));
     ESP_LOGI(TAG, "ES8311 software reset complete");
 }
@@ -93,7 +103,7 @@ void Es8311AudioCodec::UpdateDeviceState() {
 
         esp_codec_dev_sample_info_t fs = {
             .bits_per_sample = 16,
-            .channel = 1,
+            .channel = (uint8_t)input_channels_,
             .channel_mask = 0,
             .sample_rate = (uint32_t)input_sample_rate_,
             .mclk_multiple = 0,
@@ -112,7 +122,8 @@ void Es8311AudioCodec::UpdateDeviceState() {
     }
 }
 
-void Es8311AudioCodec::CreateDuplexChannels(gpio_num_t mclk, gpio_num_t bclk, gpio_num_t ws, gpio_num_t dout, gpio_num_t din) {
+void Es8311AudioCodec::CreateDuplexChannels(gpio_num_t mclk, gpio_num_t bclk, gpio_num_t ws,
+                                            gpio_num_t dout, gpio_num_t din) {
     assert(input_sample_rate_ == output_sample_rate_);
 
     i2s_chan_config_t chan_cfg = {
@@ -127,41 +138,34 @@ void Es8311AudioCodec::CreateDuplexChannels(gpio_num_t mclk, gpio_num_t bclk, gp
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx_handle_, &rx_handle_));
 
     i2s_std_config_t std_cfg = {
-        .clk_cfg = {
-            .sample_rate_hz = (uint32_t)output_sample_rate_,
-            .clk_src = I2S_CLK_SRC_DEFAULT,
+        .clk_cfg =
+            {
+                .sample_rate_hz = (uint32_t)output_sample_rate_,
+                .clk_src = I2S_CLK_SRC_DEFAULT,
 #if SOC_I2S_HW_VERSION_2
-            .ext_clk_freq_hz = 0,
+                .ext_clk_freq_hz = 0,
 #endif
-            .mclk_multiple = I2S_MCLK_MULTIPLE_256,
-        },
-        .slot_cfg = {
-            .data_bit_width = I2S_DATA_BIT_WIDTH_16BIT,
-            .slot_bit_width = I2S_SLOT_BIT_WIDTH_AUTO,
-            .slot_mode = I2S_SLOT_MODE_STEREO,
-            .slot_mask = I2S_STD_SLOT_BOTH,
-            .ws_width = I2S_DATA_BIT_WIDTH_16BIT,
-            .ws_pol = false,
-            .bit_shift = true,
+                .mclk_multiple = I2S_MCLK_MULTIPLE_256,
+            },
+        .slot_cfg = {.data_bit_width = I2S_DATA_BIT_WIDTH_16BIT,
+                     .slot_bit_width = I2S_SLOT_BIT_WIDTH_AUTO,
+                     .slot_mode = I2S_SLOT_MODE_STEREO,
+                     .slot_mask = I2S_STD_SLOT_BOTH,
+                     .ws_width = I2S_DATA_BIT_WIDTH_16BIT,
+                     .ws_pol = false,
+                     .bit_shift = true,
 #if SOC_I2S_HW_VERSION_2
-            .left_align = true,
-            .big_endian = false,
-            .bit_order_lsb = false
+                     .left_align = true,
+                     .big_endian = false,
+                     .bit_order_lsb = false
 #endif
         },
-        .gpio_cfg = {
-            .mclk = mclk,
-            .bclk = bclk,
-            .ws = ws,
-            .dout = dout,
-            .din = din,
-            .invert_flags = {
-                .mclk_inv = false,
-                .bclk_inv = false,
-                .ws_inv = false
-            }
-        }
-    };
+        .gpio_cfg = {.mclk = mclk,
+                     .bclk = bclk,
+                     .ws = ws,
+                     .dout = dout,
+                     .din = din,
+                     .invert_flags = {.mclk_inv = false, .bclk_inv = false, .ws_inv = false}}};
 
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_handle_, &std_cfg));
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(rx_handle_, &std_cfg));
@@ -176,6 +180,19 @@ void Es8311AudioCodec::SetOutputVolume(int volume) {
         ESP_ERROR_CHECK(esp_codec_dev_set_out_vol(dev_, volume));
     }
     AudioCodec::SetOutputVolume(volume);
+}
+
+void Es8311AudioCodec::SetInputGain(float gain) {
+    if (!std::isfinite(gain)) {
+        return;
+    }
+    // ES8311 microphone PGA steps are 6 dB, from 0 through 42 dB.
+    gain = std::floor(std::clamp(gain, 0.0f, 42.0f) / 6.0f) * 6.0f;
+    std::lock_guard<std::mutex> lock(data_if_mutex_);
+    if (dev_ != nullptr) {
+        ESP_ERROR_CHECK(esp_codec_dev_set_in_gain(dev_, gain));
+    }
+    AudioCodec::SetInputGain(gain);
 }
 
 void Es8311AudioCodec::EnableInput(bool enable) {
@@ -204,14 +221,29 @@ void Es8311AudioCodec::EnableOutput(bool enable) {
 
 int Es8311AudioCodec::Read(int16_t* dest, int samples) {
     if (input_enabled_) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_read(dev_, (void*)dest, samples * sizeof(int16_t)));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            esp_codec_dev_read(dev_, (void*)dest, samples * sizeof(int16_t)));
     }
     return samples;
 }
 
 int Es8311AudioCodec::Write(const int16_t* data, int samples) {
     if (output_enabled_) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_write(dev_, (void*)data, samples * sizeof(int16_t)));
+        if (input_reference_) {
+            // A shared codec_dev uses the same stereo format for RX and TX.
+            // ES8311 returns ADC left / internal DAC reference right; duplicate
+            // mono playback into both TX slots without changing its duration.
+            stereo_output_.resize(samples * 2);
+            for (int i = 0; i < samples; ++i) {
+                stereo_output_[2 * i] = data[i];
+                stereo_output_[2 * i + 1] = data[i];
+            }
+            ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_write(
+                dev_, stereo_output_.data(), stereo_output_.size() * sizeof(int16_t)));
+        } else {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(
+                esp_codec_dev_write(dev_, (void*)data, samples * sizeof(int16_t)));
+        }
     }
     return samples;
 }

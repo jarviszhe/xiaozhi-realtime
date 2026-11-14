@@ -1,16 +1,18 @@
 # Realtime Debug
 
-Standalone Go collector and local browser view for XiaoZhi Realtime traces. It does not proxy the Aliyun connection. The Waveshare 3.5B firmware includes a bounded device-side trace sender.
+Standalone Go Debug Proxy, collector, and local browser view for XiaoZhi Realtime. Proxy mode transparently relays the ESP32 WebSocket to Aliyun, preserving application frame order and recording the raw bidirectional exchange. The legacy TCP collector remains available for device-side AEC and offline diagnostics.
 
 ## Run
 
 Requires Go 1.22 or newer. From this directory:
 
 ```sh
-go run ./cmd/realtime-debug --collector-listen 192.168.1.20:7319
+go run ./cmd/realtime-debug --collector-listen 192.168.1.20:7319 --proxy-listen 0.0.0.0:7321 --upstream-url 'wss://<workspace>.<region>.maas.aliyuncs.com/api-ws/v1/realtime?model=qwen3.8-omni-flash-realtime'
 ```
 
-Replace `192.168.1.20` with the development computer's LAN address. The browser opens at `http://127.0.0.1:7320`. The device uses `tcp://192.168.1.20:7319`. `--web-listen`, `--data-dir`, and `--max-session-mib` override the defaults. Recordings default to the OS user cache directory under `xiaozhi-realtime-debug`, outside this repository.
+Replace `192.168.1.20` with the development computer's LAN address. The browser opens at `http://127.0.0.1:7320`. Legacy device traces use `tcp://192.168.1.20:7319`; the ESP32 WebSocket Proxy URL is `ws://192.168.1.20:7321/realtime`. `--web-listen`, `--proxy-listen`, `--upstream-url`, `--data-dir`, and `--max-session-mib` override the defaults. Recordings default to the OS user cache directory under `xiaozhi-realtime-debug`, outside this repository.
+
+For Proxy mode, set the ESP32 WebSocket address to `ws://192.168.1.20:7321/realtime` in the device configuration page. The ESP32 keeps sending its existing Aliyun authorization Header; the proxy copies it only for the upstream handshake and never records it. The upstream URL is configured on the Go command line, while WebSocket application frames are forwarded unchanged and in order.
 
 After the board joins Wi-Fi, open `http://<device-ip>/`. Under **Debug capture**, enter the collector address, enable capture, and choose level 0 (local events), 1 (events and WebSocket payloads), or 2 (plus PCM). Save and reboot the board. The same page selects XiaoZhi or Aliyun and configures the Aliyun region, workspace ID, and API Key. A blank Key field retains the saved Key; the page never returns its value.
 
@@ -117,34 +119,56 @@ or ends a conversation. The endpoint rejects requests when debug is disabled.
 `GET /api/test/stats` reports the current `mode`, `state`, and AEC enable state
 on software-AEC builds. Physical single/double-click recognition still needs a
 button test; the HTTP action cannot validate debouncing.
+The snapshots also include `codec_reference`, `input_channels`, microphone
+gain and output volume. An ES8311 internal DAC reference uses two capture slots
+(microphone left, digital DAC reference right). Software reference delay scans
+do not shift that hardware-supplied reference.
 
 Prepare two local PCM WAV files: a request for a long reply and an interruption
 request. The computer speaker should be beside the device. Run on Windows:
 
 ```powershell
 python tools/realtime-debug/scripts/realtime_test.py --mode realtime `
-  --question question.wav --interrupt interrupt.wav --output tmp-realtime-test
+  --question question.wav --interrupt interrupt.wav `
+  --expect-input 'stop.*three.*five' --expect-reply '(eight|8)' `
+  --output tmp-realtime-test
 ```
 
 The runner waits for actual device playback before playing the interruption,
 ends the session, waits for the trace to close, and exports event timing,
 resource snapshots, computer speech markers and audio tracks. Markers include
 the estimated device time and the clock synchronization uncertainty.
-It rejects incomplete traces and verifies cloud speech-start events and continued
-upload. Inspect the saved transcript and timing for false interruptions and
-recognition accuracy; these assertions alone do not certify usable full duplex.
-The current assertion expects exactly two cloud speech-start events. A real
-interruption split into several turns can fail this check, while an echo-triggered
-stop before the computer speech starts can escape it. Review the speech markers,
-playback and cancellation timing, transcripts, and subsequent replies together;
-a successful script exit is not an acceptance result for Realtime interruption.
+It writes `result.json` on run/export failures and exits nonzero on failure.
+Interruption acceptance requires explicit input/reply regular expressions, a
+speech-start event within `--max-detection-ms` (default 1500), continued uplink,
+the matching completed answer, and at least five seconds of subsequent evidence.
+It rejects early playback cancellation, later self-conversation, incomplete
+traces, and sessions that close before the observation ends. Speech-start counts
+alone are not acceptance: a real interruption can span several detected turns.
+Server `audio_start_ms` is mapped through uploaded PCM to expose delayed event
+delivery; this is an estimate of submission timing, not microphone onset or an
+exact measurement of when the speaker stopped. Computer speech markers describe
+the playback API call and do not measure the PC sound card's acoustic latency.
+`--far-only --observe-seconds 30` tests a device reply without PC interruption.
 `--mode manual` or `--mode auto` without `--interrupt` exercises turn-taking.
+
+For controlled diagnostics, `--aec-policy playback|continuous` selects a temporary
+Realtime policy; Manual/Auto still bypass AEC. `--aec-tracks` adds mic/reference/
+output tracks to the next conversation. `--input-gain 18|24|30` temporarily sets
+the codec's microphone gain in dB. These options require the matching diagnostic
+firmware and an idle device. They are not persisted; ES8311 gain is quantized to
+its 6 dB PGA steps. Lower gain must be tested for both clipping and near speech.
+`--output-volume 1..100` records the original speaker volume, applies a test
+volume and restores it after stopping, including on setup/run failures. This
+uses the codec's persistent volume setter, so check `result.json` for restoration
+errors. Other diagnostic choices last until changed or the device restarts.
 
 At capture level 2, audio-bearing WebSocket JSON is omitted in favor of PCM
 tracks; other cloud events remain available. Level 1 retains the raw WebSocket
 audio messages. Playback PCM records samples submitted locally, not both received
 downlink and submitted output. Live conversations record uplink (the processed
 microphone signal) and playback, keeping diagnostic traffic below a simultaneous
-five-track capture. Dedicated AEC tests additionally record mic/reference/output
+five-track capture. The optional `--aec-tracks` profile and dedicated AEC tests
+additionally record mic/reference/output
 in 64 ms batches, including the final partial batch. Compare the two test profiles
 separately; live conversation recordings alone cannot quantify echo suppression.

@@ -61,7 +61,11 @@ DebugTrace& DebugTrace::Instance() {
 }
 
 void DebugTrace::Configure(const AliyunRealtimeConfig& config) {
-    if (!config.debug_enabled || !ValidateAliyunRealtimeConfig(config))
+    // Proxy mode already records the complete WebSocket exchange on the Go
+    // side. Keep the legacy TCP trace disabled there so its extra traffic
+    // cannot perturb the realtime connection.
+    if (!config.debug_enabled || !config.websocket_url.empty() ||
+        !ValidateAliyunRealtimeConfig(config))
         return;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -81,6 +85,7 @@ void DebugTrace::Configure(const AliyunRealtimeConfig& config) {
 }
 
 void DebugTrace::Open(const char* mode, bool capture_aec) {
+    capture_aec = capture_aec || conversation_aec_capture_.load();
     if (!enabled_)
         return;
     std::lock_guard<std::mutex> aec_lock(aec_mutex_);

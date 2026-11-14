@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jarviszhe/xiaozhi-realtime/tools/realtime-debug/internal/proxy"
 	"github.com/jarviszhe/xiaozhi-realtime/tools/realtime-debug/internal/store"
 	"github.com/jarviszhe/xiaozhi-realtime/tools/realtime-debug/internal/trace"
 	"github.com/jarviszhe/xiaozhi-realtime/tools/realtime-debug/internal/web"
@@ -33,6 +34,8 @@ func defaultDataDir() string {
 func main() {
 	collectorAddr := flag.String("collector-listen", "127.0.0.1:7319", "TCP address for the device")
 	webAddr := flag.String("web-listen", "127.0.0.1:7320", "HTTP address for the browser")
+	proxyAddr := flag.String("proxy-listen", "0.0.0.0:7321", "WebSocket address for the device proxy")
+	upstreamURL := flag.String("upstream-url", "", "Aliyun Realtime WebSocket URL")
 	dataDir := flag.String("data-dir", defaultDataDir(), "recording directory")
 	maxMiB := flag.Int64("max-session-mib", 256, "maximum payload MiB per session")
 	flag.Parse()
@@ -52,6 +55,24 @@ func main() {
 		collector.Close()
 		log.Fatal(err)
 	}
+	var proxyService *proxy.Server
+	var proxyListener net.Listener
+	var proxyServer *http.Server
+	if *upstreamURL != "" {
+		proxyService, err = proxy.New(proxy.Config{UpstreamURL: *upstreamURL, Store: data})
+		if err != nil {
+			collector.Close()
+			webListener.Close()
+			log.Fatal(err)
+		}
+		proxyListener, err = net.Listen("tcp", *proxyAddr)
+		if err != nil {
+			collector.Close()
+			webListener.Close()
+			log.Fatal(err)
+		}
+		proxyServer = &http.Server{Handler: proxyService.Handler(), ReadHeaderTimeout: 10 * time.Second}
+	}
 	server := &http.Server{Handler: web.New(data), ReadHeaderTimeout: 5 * time.Second}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -64,6 +85,14 @@ func main() {
 			stop()
 		}
 	}()
+	if proxyServer != nil {
+		go func() {
+			if err := proxyServer.Serve(proxyListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Printf("proxy server: %v", err)
+				stop()
+			}
+		}()
+	}
 	go func() {
 		for {
 			conn, err := collector.Accept()
@@ -99,9 +128,18 @@ func main() {
 	}()
 	log.Printf("collector: tcp://%s", collector.Addr())
 	log.Printf("web: http://%s", webListener.Addr())
+	if proxyListener != nil {
+		log.Printf("proxy: ws://%s/realtime -> %s", proxyListener.Addr(), *upstreamURL)
+	}
 	log.Printf("data: %s", *dataDir)
 	<-ctx.Done()
 	collector.Close()
+	if proxyServer != nil {
+		proxyServer.Close()
+	}
+	if proxyService != nil {
+		proxyService.Close()
+	}
 	currentMu.Lock()
 	if current != nil {
 		current.Close()
