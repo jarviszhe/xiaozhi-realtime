@@ -59,7 +59,7 @@ ES8311 ADC / 内部 DAC 参考
 
 ## 最终实测结果（2026-11-14）
 
-本轮固件已通过 ESP-IDF 6.1 的 Waveshare 3.5B 标准变体构建，并在 COM3 烧录。日志确认 `Hash of data verified` 和 `Done`，设备启动流水线包含 `AEC(FD_LOW_COST, NLP_AGGRESSIVE) -> NS(nsnet2) -> VAD -> WakeNet(wn9_hiesp)`。
+本轮固件已通过 ESP-IDF 6.1 的 Waveshare 3.5B 标准变体构建，并在 COM3 烧录。日志确认 `Hash of data verified` 和 `Done`，设备启动流水线包含 `AEC(FD_LOW_COST, NLP_NORMAL) -> NS(nsnet2) -> VAD -> WakeNet(wn9_hiesp)`。
 
 为保持实时处理，将双核 ESP32-S3 上使用 NSNet2 的输入任务移至 core 1，避开 Wi-Fi 的 core 0。为避免诊断传输短暂阻塞造成录音缺块，将有 PSRAM 时的 trace 队列上限由 512 KiB 调整为 1 MiB；仍为有界队列，音频任务不等待网络。
 

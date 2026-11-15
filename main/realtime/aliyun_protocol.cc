@@ -1,4 +1,5 @@
 #include "aliyun_protocol.h"
+#include "audio_base64.h"
 
 #include <esp_log.h>
 #include <cJSON.h>
@@ -313,17 +314,31 @@ void AliyunProtocol::HandleEvent(const char* data, size_t size, uint32_t generat
             if (length <= 128 * 1024) {
                 std::vector<uint8_t> pcm(length * 3 / 4 + 4);
                 size_t count = 0;
-                if (mbedtls_base64_decode(pcm.data(), pcm.size(), &count,
-                                          reinterpret_cast<const unsigned char*>(delta),
-                                          length) == 0 &&
+                if ((realtime_audio::DecodeBase64(delta, length, pcm.data(), pcm.size(), count) ||
+                     mbedtls_base64_decode(pcm.data(), pcm.size(), &count,
+                                           reinterpret_cast<const unsigned char*>(delta),
+                                           length) == 0) &&
                     count % 2 == 0) {
-                    for (size_t offset = 0; offset < count; offset += 4800) {
+                    pcm.resize(count);
+                    // Preserve normal cloud deltas (typically 320 ms) as one
+                    // packet. Splitting them into 100 ms pieces exhausted the
+                    // packet-count queue during long, faster-than-playback replies.
+#if CONFIG_SPIRAM_USE_MALLOC
+                    constexpr size_t kMaxPcmPacketBytes = 24000;
+#else
+                    constexpr size_t kMaxPcmPacketBytes = 4800;
+#endif
+                    for (size_t offset = 0; offset < count; offset += kMaxPcmPacketBytes) {
                         auto packet = std::make_unique<AudioStreamPacket>();
                         packet->pcm = true;
                         packet->sample_rate = 24000;
-                        packet->frame_duration = 100;
-                        size_t end = std::min(offset + 4800, count);
-                        packet->payload.assign(pcm.begin() + offset, pcm.begin() + end);
+                        size_t end = std::min(offset + kMaxPcmPacketBytes, count);
+                        packet->frame_duration = (end - offset) * 1000 / (24000 * sizeof(int16_t));
+                        if (offset == 0 && end == count) {
+                            packet->payload = std::move(pcm);
+                        } else {
+                            packet->payload.assign(pcm.begin() + offset, pcm.begin() + end);
+                        }
                         on_incoming_audio_(std::move(packet));
                     }
                 }

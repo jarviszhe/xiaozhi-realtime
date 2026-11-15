@@ -38,14 +38,18 @@
  */
 
 #define OPUS_FRAME_DURATION_MS 60
-#define MAX_ENCODE_TASKS_IN_QUEUE 2
+#define MAX_ENCODE_TASKS_IN_QUEUE 8
 #define MAX_PLAYBACK_TASKS_IN_QUEUE 8
 // Keep several seconds of compressed/PCM audio available so short network
 // delivery stalls do not immediately empty the speaker queue. Realtime PCM
 // packets are admitted non-blocking and are dropped only while this limit is
 // reached; later packets can resume once playback creates room.
 #define MAX_DECODE_PACKETS_IN_QUEUE (6000 / OPUS_FRAME_DURATION_MS)
-#define MAX_SEND_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
+// Keep up to 7.2 seconds of compressed uplink audio so short main-task or
+// Wi-Fi stalls do not turn into permanent microphone gaps. The queue is
+// bounded; realtime capture still drops the oldest stale packet if a stall
+// lasts longer than this window.
+#define MAX_SEND_PACKETS_IN_QUEUE (7200 / OPUS_FRAME_DURATION_MS)
 #define AUDIO_TESTING_MAX_DURATION_MS 10000
 #define MAX_TIMESTAMPS_IN_QUEUE 3
 
@@ -102,6 +106,8 @@ enum AudioTaskType {
 struct AudioTask {
     AudioTaskType type;
     std::vector<int16_t> pcm;
+    // Native-rate PCM can retain the received payload until output consumes it.
+    std::unique_ptr<AudioStreamPacket> pcm_packet;
     uint32_t timestamp = 0;
     uint32_t playback_id = 0;
     uint32_t media_position_ms = 0;
@@ -115,6 +121,28 @@ struct DebugStatistics {
     uint32_t playback_count = 0;
     uint32_t encode_drop_count = 0;
     uint32_t decode_drop_count = 0;
+    uint32_t send_queue_drop_count = 0;
+    uint32_t encoded_frame_count = 0;
+    uint32_t encode_error_count = 0;
+    uint32_t send_queue_push_count = 0;
+    uint32_t send_queue_pop_count = 0;
+};
+
+struct AudioPlaybackDiagnostics {
+    size_t decode_packets = 0;
+    size_t playback_tasks = 0;
+    size_t queued_pcm_bytes = 0;
+    size_t queued_playback_samples = 0;
+    uint32_t decode_drops = 0;
+    uint32_t encode_drops = 0;
+    uint32_t pcm_accepted_samples = 0;
+    uint32_t pcm_written_samples = 0;
+    uint32_t send_queue_packets = 0;
+    uint32_t send_queue_drops = 0;
+    uint32_t encoded_frames = 0;
+    uint32_t encode_errors = 0;
+    uint32_t send_queue_pushes = 0;
+    uint32_t send_queue_pops = 0;
 };
 
 class AudioService {
@@ -131,6 +159,7 @@ public:
     std::vector<std::string> GetWakeWords() const;
     bool IsIdle();
     bool IsPlaybackIdle();
+    AudioPlaybackDiagnostics GetPlaybackDiagnostics();
     bool IsWakeWordRunning() const {
         return xEventGroupGetBits(event_group_) & AS_EVENT_WAKE_WORD_RUNNING;
     }
@@ -176,6 +205,8 @@ private:
     std::mutex input_resampler_mutex_;
     esp_ae_rate_cvt_handle_t input_resampler_ = nullptr;
     esp_ae_rate_cvt_handle_t output_resampler_ = nullptr;
+    // Only the input task reads codec PCM; retain its native-rate scratch storage.
+    std::vector<int16_t> codec_input_buffer_;
 
     // Encoder/Decoder state
     int encoder_sample_rate_ = 16000;
@@ -202,10 +233,21 @@ private:
     // decode queue. Both queues must share this capacity so swap() is valid.
     static constexpr size_t kAudioTestingPacketCapacity =
         AUDIO_TESTING_MAX_DURATION_MS / OPUS_FRAME_DURATION_MS;
-    FixedQueue<std::unique_ptr<AudioStreamPacket>, kAudioTestingPacketCapacity> audio_decode_queue_;
+#if CONFIG_ALIYUN_REALTIME && CONFIG_SPIRAM_USE_MALLOC
+    // Cloud PCM can arrive twice as fast as playback. Bound both packet slots
+    // and bytes (about 65 seconds of 24 kHz mono), without blocking network RX.
+    static constexpr size_t kDecodePacketCapacity = 256;
+    static constexpr size_t kDecodePcmByteLimit = 3 * 1024 * 1024;
+#else
+    static constexpr size_t kDecodePacketCapacity = MAX_DECODE_PACKETS_IN_QUEUE;
+    static constexpr size_t kDecodePcmByteLimit = 4800 * MAX_DECODE_PACKETS_IN_QUEUE;
+#endif
+    static constexpr size_t kAudioPacketCapacity =
+        kDecodePacketCapacity > kAudioTestingPacketCapacity ? kDecodePacketCapacity
+                                                            : kAudioTestingPacketCapacity;
+    FixedQueue<std::unique_ptr<AudioStreamPacket>, kAudioPacketCapacity> audio_decode_queue_;
     FixedQueue<std::unique_ptr<AudioStreamPacket>, MAX_SEND_PACKETS_IN_QUEUE> audio_send_queue_;
-    FixedQueue<std::unique_ptr<AudioStreamPacket>, kAudioTestingPacketCapacity>
-        audio_testing_queue_;
+    FixedQueue<std::unique_ptr<AudioStreamPacket>, kAudioPacketCapacity> audio_testing_queue_;
     FixedQueue<AudioTask, MAX_ENCODE_TASKS_IN_QUEUE> audio_encode_queue_;
     FixedQueue<AudioTask, MAX_PLAYBACK_TASKS_IN_QUEUE> audio_playback_queue_;
     bool decode_in_flight_ = false;
@@ -215,6 +257,10 @@ private:
     bool playback_drained_notified_ = true;
     uint32_t playback_generation_ = 0;
     uint32_t capture_generation_ = 0;
+    size_t decode_pcm_bytes_ = 0;
+    size_t playback_buffered_samples_ = 0;
+    uint32_t pcm_accepted_samples_ = 0;
+    std::atomic<uint32_t> pcm_written_samples_{0};
     // For server AEC
     FixedQueue<uint32_t, MAX_TIMESTAMPS_IN_QUEUE> timestamp_queue_;
 

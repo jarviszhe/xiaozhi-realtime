@@ -102,6 +102,7 @@ private:
     std::string last_detected_wake_word_;
     std::vector<int16_t> input_buffer_;
     std::vector<int16_t> output_buffer_;
+    std::vector<int16_t> near_end_recovery_buffer_;
     std::mutex input_buffer_mutex_;
 #if CONFIG_WAVESHARE_3_5B_SOFTWARE_AEC
     static constexpr size_t kReferenceCapacity = 16000;
@@ -132,6 +133,19 @@ private:
     std::atomic<uint32_t> diagnostic_fetch_frames_{0};
     std::atomic<uint32_t> diagnostic_fetch_samples_{0};
     std::atomic<uint32_t> diagnostic_fetch_errors_{0};
+    std::atomic<uint32_t> diagnostic_double_talk_frames_{0};
+    std::atomic<uint32_t> diagnostic_near_end_recovery_frames_{0};
+    std::atomic<uint32_t> diagnostic_near_end_recovery_samples_{0};
+    std::atomic<uint32_t> diagnostic_raw_data_frames_{0};
+    std::atomic<uint32_t> diagnostic_raw_data_channels_{0};
+    std::atomic<uint32_t> diagnostic_vad_speech_frames_{0};
+    std::atomic<uint32_t> diagnostic_near_end_candidate_frames_{0};
+    std::atomic<uint32_t> diagnostic_last_raw_rms_squared_{0};
+    std::atomic<uint32_t> diagnostic_last_output_rms_squared_{0};
+    std::atomic<int32_t> diagnostic_last_data_volume_db10_{0};
+    std::atomic<uint32_t> diagnostic_max_raw_rms_squared_{0};
+    std::atomic<uint32_t> diagnostic_max_output_rms_squared_{0};
+    std::atomic<int32_t> diagnostic_max_data_volume_db10_{0};
 #endif
 
     std::function<void(const std::string&)> wake_word_detected_callback_;

@@ -383,15 +383,20 @@ class AliyunRealtimeTests(unittest.TestCase):
                     auto result=*p&b;if(clear)*p&=~b;return result;
                 }
             ''',
-            "esp_log.h": "#define ESP_LOGI(...)\n#define ESP_LOGW(...)\n#define ESP_LOGE(...)\n",
+            "esp_log.h": "#define ESP_LOGI(...)\n#define ESP_LOGW(...)\n#define ESP_LOGE(...)\n#define ESP_LOGD(...)\n",
             "mbedtls/base64.h": r'''
                 #pragma once
                 #include <cstring>
                 inline int mbedtls_base64_encode(unsigned char* out,size_t,size_t* n,const unsigned char*,size_t){
                     memcpy(out,"AAA=",4);*n=4;return 0;
                 }
-                inline int mbedtls_base64_decode(unsigned char* out,size_t,size_t* n,const unsigned char*,size_t){
-                    out[0]=out[1]=0;*n=2;return 0;
+                inline int mbedtls_base64_decode(unsigned char* out,size_t capacity,size_t* n,const unsigned char* in,size_t length){
+                    *n=length/4*3;
+                    if(length && in[length-1]=='=')--*n;
+                    if(length>1 && in[length-2]=='=')--*n;
+                    if(*n>capacity)return -1;
+                    for(size_t i=0;i<*n;++i)out[i]=i%251;
+                    return 0;
                 }
             ''',
             "application.h": r'''
@@ -521,6 +526,35 @@ class AliyunRealtimeTests(unittest.TestCase):
                 manual->Emit(R"({"type":"input_audio_buffer.committed"})");
                 p.CloseAudioChannel();Application::GetInstance().Run();
                 assert(manual->sent.back().find("response.create")==std::string::npos);
+                // Long replies must preserve every sample across packet boundaries.
+                assert(p.OpenAudioChannel());auto large=Board::GetInstance().GetNetwork()->socket;
+                large->Emit(R"({"type":"response.created","response":{"id":"large"}})");
+                std::vector<uint8_t> received;std::vector<size_t> packet_sizes;
+                p.OnIncomingAudio([&](auto packet){
+                    assert(packet->pcm && packet->sample_rate==24000);
+                    packet_sizes.push_back(packet->payload.size());
+                    received.insert(received.end(),packet->payload.begin(),packet->payload.end());
+                });
+                auto emit=[&](size_t encoded){large->Emit(
+                    "{\"type\":\"response.audio.delta\",\"response_id\":\"large\",\"delta\":\""+
+                    std::string(encoded,'A')+"\"}");};
+                emit(20480); // The actual cloud's 320 ms / 15360 byte deltas.
+                assert(received.size()==15360);
+#if CONFIG_SPIRAM_USE_MALLOC
+                assert(packet_sizes.size()==1);
+#else
+                assert(packet_sizes.size()==4);
+#endif
+                for(size_t i=0;i<received.size();++i)assert(received[i]==0);
+                received.clear();packet_sizes.clear();
+                emit(128000); // Split a large delta at the native PCM bound.
+                assert(received.size()==96000);
+                for(size_t i=0;i<received.size();++i)assert(received[i]==0);
+                for(size_t size:packet_sizes)assert(size<=24000 && size%2==0);
+                received.clear();
+                emit(4); // Three decoded bytes are not complete int16 PCM.
+                emit(128*1024+4); // Oversized network input remains rejected.
+                assert(received.empty());
             }
         '''
         with tempfile.TemporaryDirectory() as folder:
@@ -533,13 +567,16 @@ class AliyunRealtimeTests(unittest.TestCase):
                 (ROOT / "main/realtime/aliyun_protocol.cc").read_text(encoding="utf-8"))
             (path / "driver.cc").write_text(textwrap.dedent(driver))
             binary = path / ("protocol-test.exe" if os.name == "nt" else "protocol-test")
-            result = subprocess.run(compiler + ["-std=c++17", "-I", str(path),
-                "-I", str(ROOT / "main/realtime"), "-I", str(ROOT / "main/protocols"),
-                "-I", str(cjson), str(path / "driver.cc"), str(path / "aliyun_protocol.cc"),
-                "-x", "c++", str(cjson / "cJSON.c"), "-o", str(binary)], capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=15)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            for psram in (0, 1):
+                with self.subTest(psram=psram):
+                    result = subprocess.run(compiler + ["-std=c++17",
+                        f"-DCONFIG_SPIRAM_USE_MALLOC={psram}", "-I", str(path),
+                        "-I", str(ROOT / "main/realtime"), "-I", str(ROOT / "main/protocols"),
+                        "-I", str(cjson), str(path / "driver.cc"), str(path / "aliyun_protocol.cc"),
+                        "-x", "c++", str(cjson / "cJSON.c"), "-o", str(binary)], capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=15)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

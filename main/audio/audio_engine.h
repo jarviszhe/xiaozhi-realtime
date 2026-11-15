@@ -21,6 +21,19 @@ struct AudioEngineDiagnostics {
     uint32_t fetch_frames = 0;
     uint32_t fetch_samples = 0;
     uint32_t fetch_errors = 0;
+    uint32_t double_talk_frames = 0;
+    uint32_t near_end_recovery_frames = 0;
+    uint32_t near_end_recovery_samples = 0;
+    uint32_t raw_data_frames = 0;
+    uint32_t raw_data_channels = 0;
+    uint32_t vad_speech_frames = 0;
+    uint32_t near_end_candidate_frames = 0;
+    uint32_t last_raw_rms_squared = 0;
+    uint32_t last_output_rms_squared = 0;
+    int32_t last_data_volume_db10 = 0;
+    uint32_t max_raw_rms_squared = 0;
+    uint32_t max_output_rms_squared = 0;
+    int32_t max_data_volume_db10 = 0;
 };
 
 class AudioEngine {

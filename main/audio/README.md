@@ -139,9 +139,38 @@ activity; the engine refactor does not change that policy.
 
 ## Queue and allocation policy
 
-The service queues use compile-time fixed-capacity storage. Their existing drop,
-wait, and playback-drain policies remain unchanged, but queue growth no longer
-allocates deque nodes. `AudioTask` values are stored directly, and Opus encoding
-writes into the packet payload instead of allocating a second temporary output
-buffer. Packet and PCM buffer pools should only be added after target-side heap
-and latency measurements justify their additional ownership complexity.
+The service queues use compile-time fixed-capacity storage, so queue growth does
+not allocate deque nodes. `AudioTask` values are stored directly, and Opus
+encoding writes into the packet payload. The input task reuses its codec and
+resampled PCM buffers between synchronous engine feeds. Raw input tracing still
+captures codec PCM before resampling.
+
+Aliyun PCM can arrive faster than the speaker plays it. With
+`CONFIG_SPIRAM_USE_MALLOC`, the protocol retains each normal cloud delta in one
+packet, capped at 24,000 bytes (500 ms at 24 kHz mono). The decode queue allows
+256 PCM packets and at most 3 MiB of queued PCM, approximately 65.5 seconds at
+that format. Both limits apply; this is a bounded backlog, not support for
+arbitrarily long replies arriving faster than playback. Builds without this
+PSRAM allocation configuration retain 4,800-byte protocol packets and the
+100-packet decode limit. Opus admission stays at 100 packets. Recording-test
+duration retains its original limit independently of the physical queue storage.
+
+PCM matching the codec output rate retains its packet payload through playback,
+avoiding an unnecessary decoder and full-packet copy. The output task still
+writes at most 20 ms per chunk and checks playback generation before each write.
+Cancellation clears both queues and rejects old in-flight work. Startup
+prebuffering requires either four playback tasks or 200 ms of samples, with the
+existing timeout for shorter replies.
+
+The diagnostic `/api/test/stats` response includes `queues`: decode/playback
+queue lengths, queued PCM bytes/samples, decode/encode drops, accepted PCM
+samples, and samples submitted to the codec by the native PCM path. These
+cumulative sample counters wrap at 32 bits. Submitted samples do not prove
+physical speaker output; cancellation can intentionally leave accepted samples
+unplayed. Use counter differences for one uninterrupted native-rate PCM reply.
+
+Audio Base64 uses a table decoder for ordinary unbroken payloads and falls back
+to mbedTLS for other formats. Diagnostic microphone/reference splitting is
+skipped when AEC PCM tracing is disabled; AFE input and reference timing stay
+active. Packet pools should only be added after target-side heap and latency
+measurements justify their ownership complexity.

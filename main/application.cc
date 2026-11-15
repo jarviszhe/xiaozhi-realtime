@@ -266,7 +266,7 @@ void Application::Run() {
         if (bits & MAIN_EVENT_SEND_AUDIO) {
             // Continuous Realtime capture must not monopolize event dispatch.
             int sent = 0;
-            while (sent < 4) {
+            while (sent < 16) {
                 auto packet = audio_service_.PopPacketFromSendQueue();
                 if (!packet)
                     break;
@@ -281,7 +281,7 @@ void Application::Run() {
                     break;
                 }
             }
-            if (sent == 4)
+            if (sent == 16)
                 xEventGroupSetBits(event_group_, MAIN_EVENT_SEND_AUDIO);
         }
 

@@ -80,6 +80,7 @@ bool AfeAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms,
     codec_ = codec;
     frame_samples_ = frame_duration_ms * 16000 / 1000;
     output_buffer_.reserve(frame_samples_);
+    near_end_recovery_buffer_.reserve(frame_samples_);
 
 #if CONFIG_WAVESHARE_3_5B_SOFTWARE_AEC
     if (codec_->input_reference() && codec_->input_channels() == 2) {
@@ -184,10 +185,11 @@ bool AfeAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms,
 
     afe_config->aec_init = ref_num > 0;
     afe_config->aec_mode = AEC_MODE_FD_LOW_COST;
-    // Very aggressive NLP suppresses near-end speech during double-talk on
-    // the Waveshare ES8311 reference path. Aggressive is the best measured
-    // compromise between echo suppression and interruption detection.
-    afe_config->aec_nlp_level = AEC_NLP_LEVEL_AGGR;
+    // Use the normal NLP level for full-duplex double-talk.  Aggressive NLP
+    // can suppress near-end speech when the DAC reference is loud and the
+    // acoustic path has not fully converged; in that case the AFE VAD may also
+    // miss the frame, preventing any post-AEC recovery from running.
+    afe_config->aec_nlp_level = AEC_NLP_LEVEL_NORMAL;
     // SE is microphone-array processing. Single-mic noise suppression must
     // enable NS explicitly, using the selected backend and packaged model.
     afe_config->se_init = false;
@@ -433,16 +435,19 @@ void AfeAudioEngine::Feed(std::vector<int16_t>&& data) {
             input_origin_us_.store(start_us -
                                    static_cast<int64_t>(input_sample_index_) * 1000000 / 16000);
         }
-        microphone_trace_.resize(samples);
-        aligned_reference_.resize(samples);
-        for (size_t i = 0; i < samples; ++i) {
-            microphone_trace_[i] = data[2 * i];
-            aligned_reference_[i] = data[2 * i + 1];
+        auto& trace = DebugTrace::Instance();
+        if (trace.IsAecPcmEnabled()) {
+            microphone_trace_.resize(samples);
+            aligned_reference_.resize(samples);
+            for (size_t i = 0; i < samples; ++i) {
+                microphone_trace_[i] = data[2 * i];
+                aligned_reference_[i] = data[2 * i + 1];
+            }
+            trace.AecPcm("aec_mic", microphone_trace_.data(), samples, start_us,
+                         input_sample_index_);
+            trace.AecPcm("aec_ref", aligned_reference_.data(), samples, start_us,
+                         input_sample_index_);
         }
-        DebugTrace::Instance().AecPcm("aec_mic", microphone_trace_.data(), samples, start_us,
-                                      input_sample_index_);
-        DebugTrace::Instance().AecPcm("aec_ref", aligned_reference_.data(), samples, start_us,
-                                      input_sample_index_);
         input_sample_index_ += samples;
     }
 #endif
@@ -495,6 +500,19 @@ AudioEngineDiagnostics AfeAudioEngine::GetDiagnostics() const {
     result.fetch_frames = diagnostic_fetch_frames_.load();
     result.fetch_samples = diagnostic_fetch_samples_.load();
     result.fetch_errors = diagnostic_fetch_errors_.load();
+    result.double_talk_frames = diagnostic_double_talk_frames_.load();
+    result.near_end_recovery_frames = diagnostic_near_end_recovery_frames_.load();
+    result.near_end_recovery_samples = diagnostic_near_end_recovery_samples_.load();
+    result.raw_data_frames = diagnostic_raw_data_frames_.load();
+    result.raw_data_channels = diagnostic_raw_data_channels_.load();
+    result.vad_speech_frames = diagnostic_vad_speech_frames_.load();
+    result.near_end_candidate_frames = diagnostic_near_end_candidate_frames_.load();
+    result.last_raw_rms_squared = diagnostic_last_raw_rms_squared_.load();
+    result.last_output_rms_squared = diagnostic_last_output_rms_squared_.load();
+    result.last_data_volume_db10 = diagnostic_last_data_volume_db10_.load();
+    result.max_raw_rms_squared = diagnostic_max_raw_rms_squared_.load();
+    result.max_output_rms_squared = diagnostic_max_output_rms_squared_.load();
+    result.max_data_volume_db10 = diagnostic_max_data_volume_db10_.load();
 #endif
     return result;
 }
@@ -867,17 +885,98 @@ void AfeAudioEngine::HandleVoiceResult(const afe_fetch_result_t* result) {
     }
 
     size_t samples = result->data_size / sizeof(int16_t);
+    const int16_t* output_data = result->data;
+#if CONFIG_WAVESHARE_3_5B_SOFTWARE_AEC
+    if (result->raw_data != nullptr && result->raw_data_channels > 0) {
+        diagnostic_raw_data_frames_.fetch_add(1, std::memory_order_relaxed);
+        diagnostic_raw_data_channels_.store(result->raw_data_channels,
+                                             std::memory_order_relaxed);
+    }
+    if (result->vad_state == VAD_SPEECH) {
+        diagnostic_vad_speech_frames_.fetch_add(1, std::memory_order_relaxed);
+    }
+    // During double-talk, aggressive NLP can collapse a frame even though the
+    // raw microphone still contains near-end speech. Recover a conservative
+    // portion of that speech only when the AFE itself reports speech and the
+    // output is much quieter than the raw microphone. This keeps the normal
+    // AEC path untouched for far-end-only playback and avoids attenuating the
+    // playback reference that the adaptive filter needs.
+    if (applied_aec_enabled_.load() && result->raw_data != nullptr &&
+        result->raw_data_channels > 0) {
+        uint64_t raw_sum_squared = 0;
+        uint64_t output_sum_squared = 0;
+        const int channels = result->raw_data_channels;
+        for (size_t i = 0; i < samples; ++i) {
+            const int raw = result->raw_data[i * channels];
+            const int output = result->data[i];
+            // Convert to a signed wider type before squaring. Casting a
+            // negative PCM sample directly to uint64_t turns it into a large
+            // two's-complement value and corrupts the RMS comparison.
+            const int64_t raw_sample = raw;
+            const int64_t output_sample = output;
+            raw_sum_squared += static_cast<uint64_t>(raw_sample * raw_sample);
+            output_sum_squared +=
+                static_cast<uint64_t>(output_sample * output_sample);
+        }
+        const uint64_t raw_rms_squared = raw_sum_squared / std::max<size_t>(samples, 1);
+        const uint64_t output_rms_squared = output_sum_squared / std::max<size_t>(samples, 1);
+        diagnostic_last_raw_rms_squared_.store(
+            static_cast<uint32_t>(std::min<uint64_t>(raw_rms_squared, UINT32_MAX)),
+            std::memory_order_relaxed);
+        diagnostic_last_output_rms_squared_.store(
+            static_cast<uint32_t>(std::min<uint64_t>(output_rms_squared, UINT32_MAX)),
+            std::memory_order_relaxed);
+        const auto raw_rms_value =
+            static_cast<uint32_t>(std::min<uint64_t>(raw_rms_squared, UINT32_MAX));
+        const auto output_rms_value =
+            static_cast<uint32_t>(std::min<uint64_t>(output_rms_squared, UINT32_MAX));
+        diagnostic_max_raw_rms_squared_.store(
+            std::max(diagnostic_max_raw_rms_squared_.load(std::memory_order_relaxed),
+                     raw_rms_value),
+            std::memory_order_relaxed);
+        diagnostic_max_output_rms_squared_.store(
+            std::max(diagnostic_max_output_rms_squared_.load(std::memory_order_relaxed),
+                     output_rms_value),
+            std::memory_order_relaxed);
+        const auto data_volume_db10 = static_cast<int32_t>(std::clamp(
+            result->data_volume * 10.0f, -327680.0f, 327670.0f));
+        diagnostic_last_data_volume_db10_.store(data_volume_db10, std::memory_order_relaxed);
+        diagnostic_max_data_volume_db10_.store(
+            std::max(diagnostic_max_data_volume_db10_.load(std::memory_order_relaxed),
+                     data_volume_db10),
+            std::memory_order_relaxed);
+        const bool near_end_candidate = raw_rms_squared > 700 * 700 &&
+                                        output_rms_squared * 16 < raw_rms_squared * 3;
+        if (near_end_candidate) {
+            diagnostic_near_end_candidate_frames_.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (near_end_candidate && result->vad_state == VAD_SPEECH) {
+            diagnostic_double_talk_frames_.fetch_add(1, std::memory_order_relaxed);
+            near_end_recovery_buffer_.resize(samples);
+            for (size_t i = 0; i < samples; ++i) {
+                const int raw = result->raw_data[i * channels];
+                const int output = result->data[i];
+                near_end_recovery_buffer_[i] = static_cast<int16_t>(
+                    std::clamp((output * 6 + raw * 4) / 10, -32768, 32767));
+            }
+            output_data = near_end_recovery_buffer_.data();
+            diagnostic_near_end_recovery_frames_.fetch_add(1, std::memory_order_relaxed);
+            diagnostic_near_end_recovery_samples_.fetch_add(samples,
+                                                            std::memory_order_relaxed);
+        }
+    }
+#endif
 #if CONFIG_WAVESHARE_3_5B_SOFTWARE_AEC
     if (software_reference_ready_ || codec_->input_reference()) {
         std::lock_guard<std::mutex> reference_lock(reference_mutex_);
         const int64_t start_us =
             input_origin_us_.load() + static_cast<int64_t>(output_sample_index_) * 1000000 / 16000;
-        DebugTrace::Instance().AecPcm("aec_out", result->data, samples, start_us,
+        DebugTrace::Instance().AecPcm("aec_out", output_data, samples, start_us,
                                       output_sample_index_);
         output_sample_index_ += samples;
     }
 #endif
-    output_buffer_.insert(output_buffer_.end(), result->data, result->data + samples);
+    output_buffer_.insert(output_buffer_.end(), output_data, output_data + samples);
     while (output_buffer_.size() >= static_cast<size_t>(frame_samples_)) {
         if (output_buffer_.size() == static_cast<size_t>(frame_samples_)) {
             output_callback_(std::move(output_buffer_));

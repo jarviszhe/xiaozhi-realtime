@@ -19,6 +19,7 @@ public:
     void Configure(const AliyunRealtimeConfig& config);
     void Open(const char* mode, bool capture_aec = false);
     void SetConversationAecCapture(bool enable) { conversation_aec_capture_.store(enable); }
+    bool IsAecPcmEnabled() const { return enabled_ && level_ >= 2 && capture_aec_.load(); }
     void SetMode(const char* mode);
     void Close();
     void Event(const char* type, const char* detail = "");

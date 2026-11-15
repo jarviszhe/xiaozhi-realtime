@@ -74,6 +74,35 @@ cJSON* ResourceSnapshot() {
     cJSON_AddNumberToObject(engine, "fetch_frames", audio.fetch_frames);
     cJSON_AddNumberToObject(engine, "fetch_samples", audio.fetch_samples);
     cJSON_AddNumberToObject(engine, "fetch_errors", audio.fetch_errors);
+    cJSON_AddNumberToObject(engine, "double_talk_frames", audio.double_talk_frames);
+    cJSON_AddNumberToObject(engine, "near_end_recovery_frames", audio.near_end_recovery_frames);
+    cJSON_AddNumberToObject(engine, "near_end_recovery_samples", audio.near_end_recovery_samples);
+    cJSON_AddNumberToObject(engine, "raw_data_frames", audio.raw_data_frames);
+    cJSON_AddNumberToObject(engine, "raw_data_channels", audio.raw_data_channels);
+    cJSON_AddNumberToObject(engine, "vad_speech_frames", audio.vad_speech_frames);
+    cJSON_AddNumberToObject(engine, "near_end_candidate_frames", audio.near_end_candidate_frames);
+    cJSON_AddNumberToObject(engine, "last_raw_rms_squared", audio.last_raw_rms_squared);
+    cJSON_AddNumberToObject(engine, "last_output_rms_squared", audio.last_output_rms_squared);
+    cJSON_AddNumberToObject(engine, "last_data_volume_db10", audio.last_data_volume_db10);
+    cJSON_AddNumberToObject(engine, "max_raw_rms_squared", audio.max_raw_rms_squared);
+    cJSON_AddNumberToObject(engine, "max_output_rms_squared", audio.max_output_rms_squared);
+    cJSON_AddNumberToObject(engine, "max_data_volume_db10", audio.max_data_volume_db10);
+    const auto playback = app.GetAudioService().GetPlaybackDiagnostics();
+    cJSON* queues = cJSON_AddObjectToObject(root, "queues");
+    cJSON_AddNumberToObject(queues, "decode_packets", playback.decode_packets);
+    cJSON_AddNumberToObject(queues, "playback_tasks", playback.playback_tasks);
+    cJSON_AddNumberToObject(queues, "pcm_bytes", playback.queued_pcm_bytes);
+    cJSON_AddNumberToObject(queues, "playback_samples", playback.queued_playback_samples);
+    cJSON_AddNumberToObject(queues, "decode_drops", playback.decode_drops);
+    cJSON_AddNumberToObject(queues, "encode_drops", playback.encode_drops);
+    cJSON_AddNumberToObject(queues, "pcm_accepted_samples", playback.pcm_accepted_samples);
+    cJSON_AddNumberToObject(queues, "pcm_written_samples", playback.pcm_written_samples);
+    cJSON_AddNumberToObject(queues, "send_queue_packets", playback.send_queue_packets);
+    cJSON_AddNumberToObject(queues, "send_queue_drops", playback.send_queue_drops);
+    cJSON_AddNumberToObject(queues, "encoded_frames", playback.encoded_frames);
+    cJSON_AddNumberToObject(queues, "encode_errors", playback.encode_errors);
+    cJSON_AddNumberToObject(queues, "send_queue_pushes", playback.send_queue_pushes);
+    cJSON_AddNumberToObject(queues, "send_queue_pops", playback.send_queue_pops);
 #if configUSE_TRACE_FACILITY && configGENERATE_RUN_TIME_STATS
     // This runs on the HTTP task, never on the main event loop or an audio task.
     std::vector<TaskStatus_t> tasks(uxTaskGetNumberOfTasks() + 8);

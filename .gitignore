@@ -20,6 +20,7 @@ mmap_generate_*.h
 .clangd
 
 # Local ESP32/AEC and Realtime debug artifacts
+/tmp-audio-tests/
 /aec-boot.log
 /board-list.json
 /device-boot*.log
@@ -39,6 +40,8 @@ mmap_generate_*.h
 /tools/realtime-debug/realtime-debug.exe*
 /tools/realtime-debug/tools/
 /docs/datasheet/ESP32-S3-Touch-LCD-3.5B-Schematic.pdf
+/docs/datasheet/ES8311.DS.pdf
+/docs/datasheet/ES8311.user.Guide.pdf
 
 # Local investigation notes; commit design documents explicitly when needed.
 /design/aliyun-realtime-design.md
