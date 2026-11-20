@@ -121,6 +121,7 @@ void AudioService::Start() {
     service_stopped_.store(false);
     xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING | AS_EVENT_WAKE_WORD_RUNNING |
                                            AS_EVENT_AUDIO_PROCESSOR_RUNNING |
+                                           AS_EVENT_PCM_CAPTURE |
                                            AS_EVENT_AUDIO_INPUT_STOP_REQUEST);
 
     esp_timer_start_periodic(audio_power_timer_, 1000000);
@@ -177,7 +178,7 @@ void AudioService::Stop() {
     esp_timer_stop(audio_power_timer_);
     service_stopped_.store(true);
     xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING | AS_EVENT_WAKE_WORD_RUNNING |
-                                         AS_EVENT_AUDIO_PROCESSOR_RUNNING);
+                                         AS_EVENT_AUDIO_PROCESSOR_RUNNING | AS_EVENT_PCM_CAPTURE);
 
     bool notify_drained = false;
     {
@@ -246,7 +247,7 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
 void AudioService::AudioInputTask() {
     constexpr EventBits_t kAudioInputActiveBits =
         AS_EVENT_AUDIO_TESTING_RUNNING | AS_EVENT_WAKE_WORD_RUNNING |
-        AS_EVENT_AUDIO_PROCESSOR_RUNNING | AS_EVENT_RAW_CAPTURE;
+        AS_EVENT_AUDIO_PROCESSOR_RUNNING | AS_EVENT_RAW_CAPTURE | AS_EVENT_PCM_CAPTURE;
 
     while (true) {
         EventBits_t bits = xEventGroupWaitBits(
@@ -279,6 +280,24 @@ void AudioService::AudioInputTask() {
 
         if (audio_input_need_warmup_.exchange(false)) {
             vTaskDelay(pdMS_TO_TICKS(120));
+            continue;
+        }
+
+        if (bits & AS_EVENT_PCM_CAPTURE) {
+            std::vector<int16_t> data;
+            if (ReadAudioData(data, 16000, 320)) {
+                // Board input layouts put the microphone before any reference channel.
+                const size_t channels = codec_->input_channels();
+                if (channels > 1) {
+                    const size_t samples = data.size() / channels;
+                    for (size_t i = 0; i < samples; ++i)
+                        data[i] = data[i * channels];
+                    data.resize(samples);
+                }
+                PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
+                continue;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10) > 0 ? pdMS_TO_TICKS(10) : 1);
             continue;
         }
 
@@ -384,7 +403,9 @@ void AudioService::AudioOutputTask() {
             tail_pending =
                 audio_decode_queue_.empty() && audio_playback_queue_.empty() && !decode_in_flight_;
         }
-        if (tail_pending)
+        // Live PCM arrives every 20 ms. Waiting for the entire DMA tail whenever
+        // its queue briefly empties creates gaps in a continuous phone stream.
+        if (tail_pending && !pcm_transport_.load())
             vTaskDelay(pdMS_TO_TICKS(AUDIO_CODEC_DMA_DESC_NUM * AUDIO_CODEC_DMA_FRAME_NUM * 1000 /
                                      codec_->output_sample_rate()));
 
@@ -692,7 +713,8 @@ void AudioService::PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t
         std::unique_lock<std::mutex> lock(audio_queue_mutex_);
 
         /* If the task is to send queue, we need to set the timestamp */
-        if (type == kAudioTaskTypeEncodeToSendQueue && !IsAudioProcessorRunning())
+        if (type == kAudioTaskTypeEncodeToSendQueue && !IsAudioProcessorRunning() &&
+            !(xEventGroupGetBits(event_group_) & AS_EVENT_PCM_CAPTURE))
             return;
         task.uplink_generation = uplink_generation_;
         if (type == kAudioTaskTypeEncodeToSendQueue && !timestamp_queue_.empty()) {
@@ -1015,4 +1037,13 @@ void AudioService::EnableRawCapture(bool enable) {
         xEventGroupSetBits(event_group_, AS_EVENT_RAW_CAPTURE);
     else
         xEventGroupClearBits(event_group_, AS_EVENT_RAW_CAPTURE);
+}
+
+void AudioService::EnablePcmCapture(bool enable) {
+    if (enable && pcm_transport_.load()) {
+        audio_input_need_warmup_ = true;
+        xEventGroupSetBits(event_group_, AS_EVENT_PCM_CAPTURE);
+    } else {
+        xEventGroupClearBits(event_group_, AS_EVENT_PCM_CAPTURE);
+    }
 }

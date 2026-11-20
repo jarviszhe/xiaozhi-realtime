@@ -58,6 +58,7 @@
 #define AS_EVENT_WAKE_WORD_RUNNING (1 << 1)
 #define AS_EVENT_AUDIO_PROCESSOR_RUNNING (1 << 2)
 #define AS_EVENT_RAW_CAPTURE (1 << 5)
+#define AS_EVENT_PCM_CAPTURE (1 << 3)
 #define AS_EVENT_AUDIO_INPUT_STOP_REQUEST (1 << 4)
 
 #define AS_OPUS_GET_FRAME_DRU_ENUM(duration_ms)                  \
@@ -149,7 +150,10 @@ public:
     void EnableAudioTesting(bool enable);
     void EnableDeviceAec(bool enable);
     void EnableRawCapture(bool enable);
+    // Continuous mono PCM for a local transport, without AFE/VAD gating.
+    void EnablePcmCapture(bool enable);
     void SetPcmTransport(bool enabled) { pcm_transport_.store(enabled); }
+    bool IsPcmTransport() const { return pcm_transport_.load(); }
 
     void SetCallbacks(AudioServiceCallbacks& callbacks);
 

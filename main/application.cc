@@ -82,11 +82,21 @@ void Application::Initialize() {
     auto codec = board.GetAudioCodec();
     audio_service_.Initialize(codec);
     audio_service_.Start();
+#if CONFIG_PHONE_BRIDGE
+    phone_bridge_ = std::make_unique<PhoneBridge>(audio_service_);
+    // Start the LAN bridge with the audio service. Some boards report their
+    // network as already connected before the application installs its event
+    // callback, so waiting exclusively for NetworkEvent::Connected can leave
+    // the UDP listener inactive after boot.
+    phone_bridge_->Start();
+#endif
     ESP_LOGI(TAG, "After board/audio init");
     SystemInfo::PrintHeapStats();
 
     AudioServiceCallbacks callbacks;
     callbacks.on_send_queue_available = [this]() {
+        if (audio_service_.IsPcmTransport())
+            return;  // PhoneBridge exclusively drains the local PCM transport.
         xEventGroupSetBits(event_group_, MAIN_EVENT_SEND_AUDIO);
     };
     callbacks.on_wake_word_detected = [this](const std::string& wake_word) {
@@ -270,7 +280,7 @@ void Application::Run() {
             HandleStopListeningEvent();
         }
 
-        if (bits & MAIN_EVENT_SEND_AUDIO) {
+        if ((bits & MAIN_EVENT_SEND_AUDIO) && !audio_service_.IsPcmTransport()) {
             for (int sent = 0; sent < 16; ++sent) {
                 auto packet = audio_service_.PopPacketFromSendQueue();
                 if (!packet)
@@ -338,6 +348,10 @@ void Application::Run() {
 
 void Application::HandleNetworkConnectedEvent() {
     ESP_LOGI(TAG, "Network connected");
+#if CONFIG_PHONE_BRIDGE
+    if (phone_bridge_)
+        phone_bridge_->Start();
+#endif
 #if CONFIG_ALIYUN_REALTIME
     StartAliyunConfigWeb();
 #endif

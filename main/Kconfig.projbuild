@@ -15,6 +15,15 @@ config ALIYUN_REALTIME
         Adds the LAN device configuration page and Aliyun Realtime voice path.
         This first implementation targets the Waveshare ESP32-S3 Touch LCD 3.5B.
 
+config PHONE_BRIDGE
+    bool "Enable ESP32 HFP phone UDP bridge"
+    default y if BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5B
+    default n
+    depends on IDF_TARGET_ESP32S3
+    help
+        Receives 8 kHz PCM from the classic ESP32 HFP gateway over UDP and
+        plays it through the normal audio service. Microphone PCM is sent back.
+
 choice
     prompt "Flash Assets"
     default FLASH_DEFAULT_ASSETS if !USE_EMOTE_MESSAGE_STYLE

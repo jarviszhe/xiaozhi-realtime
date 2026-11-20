@@ -21,6 +21,9 @@
 #include "notify/notify_player.h"
 #include "ota.h"
 #include "protocol.h"
+#if CONFIG_PHONE_BRIDGE
+#include "phone_bridge.h"
+#endif
 
 // Main event bits
 #define MAIN_EVENT_SCHEDULE (1 << 0)
@@ -151,6 +154,9 @@ private:
     std::string last_error_message_;
     std::string startup_wake_word_hint_message_;
     AudioService audio_service_;
+#if CONFIG_PHONE_BRIDGE
+    std::unique_ptr<PhoneBridge> phone_bridge_;
+#endif
     NotifyPlayer notify_player_;
     uint32_t notification_playback_id_ = 0;
     std::unique_ptr<Ota> ota_;

@@ -6,7 +6,6 @@
 #include <cJSON.h>
 
 #include <esp_app_desc.h>
-#include <ota_url.h>
 #include <cstring>
 #include <string>
 #include "application.h"
@@ -133,8 +132,8 @@ esp_err_t PutConfig(httpd_req_t* request) {
     const auto* ota_item = cJSON_GetObjectItemCaseSensitive(root, "xiaozhi_ota_url");
     const bool update_ota = ota_item != nullptr;
     if (update_ota)
-        valid =
-            valid && ReadString(root, "xiaozhi_ota_url", ota) && wifi_config::IsValidOtaUrl(ota);
+        valid = valid && ReadString(root, "xiaozhi_ota_url", ota) &&
+                (ota.rfind("http://", 0) == 0 || ota.rfind("https://", 0) == 0);
     if (cJSON_GetObjectItemCaseSensitive(root, "websocket_url"))
         valid = valid && ReadString(root, "websocket_url", config.websocket_url);
     if (cJSON_GetObjectItemCaseSensitive(root, "debug_input_pcm"))
