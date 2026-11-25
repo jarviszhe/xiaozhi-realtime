@@ -1,4 +1,8 @@
 #include "application.h"
+#if CONFIG_GATEWAY_MANAGER
+#include "gateway_manager.h"
+#include "gateway_serial.h"
+#endif
 #include "assets.h"
 #include "assets/lang_config.h"
 #include "audio_codec.h"
@@ -71,6 +75,13 @@ bool Application::SetDeviceState(DeviceState state) { return state_machine_.Tran
 void Application::Initialize() {
     auto& board = Board::GetInstance();
     SetDeviceState(kDeviceStateStarting);
+
+#if CONFIG_GATEWAY_MANAGER
+    // BLE controller memory must be reserved before the audio front end and
+    // wake-word models consume the remaining internal heap.
+    ESP_ERROR_CHECK(gateway_manager_start(true, nullptr));
+    StartGatewaySerial();
+#endif
 
     // Setup the display
     auto display = board.GetDisplay();

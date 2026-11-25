@@ -1200,6 +1200,11 @@ if(CONFIG_BOARD_TYPE_ESP32_P4_FUNCTION_EV_BOARD)
         sdmmc
     )
 endif()
+if(CONFIG_GATEWAY_MANAGER)
+    list(APPEND SOURCES "gateway_manager.c" "gateway_serial.cc")
+    list(APPEND MAIN_PRIV_REQUIRES_EXTRA mdns esp_driver_usb_serial_jtag)
+endif()
+
 idf_component_register(SRCS ${SOURCES}
                     EMBED_FILES ${LANG_SOUNDS} ${COMMON_SOUNDS}
                     EMBED_TXTFILES ${REALTIME_EMBED_FILES}

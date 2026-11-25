@@ -6,14 +6,18 @@
 #include <inttypes.h>
 #include <lwip/sockets.h>
 #include <sys/socket.h>
-#include <array>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 
 #include "board.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#if CONFIG_GATEWAY_MANAGER
+#include "gateway_manager.h"
+#include "gateway_serial.h"
+#endif
 
 static const char* TAG = "phone_bridge";
 static constexpr uint16_t kPort = 39001;
@@ -70,8 +74,7 @@ static bool resampler_selftest() {
 
 void PhoneBridge::Start() {
     if (!task_handle_) {
-        const BaseType_t result =
-            xTaskCreate(Task, "phone_bridge", 4096, this, 5, &task_handle_);
+        const BaseType_t result = xTaskCreate(Task, "phone_bridge", 4096, this, 5, &task_handle_);
         ESP_LOGI(TAG, "Start task result=%d handle=%p", int(result), task_handle_);
     }
 }
@@ -138,7 +141,23 @@ void PhoneBridge::Run() {
         // Keep the uplink queue drained under Bluetooth/Wi-Fi coexistence. A single
         // 60 ms capture packet may accumulate while the task is briefly preempted.
         vTaskDelay(pdMS_TO_TICKS(2) > 0 ? pdMS_TO_TICKS(2) : 1);
-        int n = recvfrom(fd, buf, sizeof(buf), 0, reinterpret_cast<sockaddr*>(&peer), &peer_len);
+        sockaddr_in incoming_peer{};
+        socklen_t incoming_peer_len = sizeof(incoming_peer);
+        int n = recvfrom(fd, buf, sizeof(buf), 0, reinterpret_cast<sockaddr*>(&incoming_peer),
+                         &incoming_peer_len);
+#if CONFIG_GATEWAY_MANAGER
+        if (n > 0 && !gateway_manager_accepts(incoming_peer.sin_addr.s_addr))
+            n = 0;
+        if (have_session && !gateway_manager_ready()) {
+            have_session = false;
+            uplink_pending.clear();
+            for (auto& pending : prebuffer)
+                pending.reset();
+            prebuffer_count = 0;
+            prefilled = false;
+            audio_.DiscardUplink();
+        }
+#endif
         const unsigned rate = n >= int(kHeader) ? r16(buf + 28) : 0;
         const size_t frame = rate == 16000 ? kFrame16 : kFrame8;
         if (n == int(kHeader + frame * 2) && std::memcmp(buf, "HFAP", 4) == 0 && buf[4] == 1 &&
@@ -150,6 +169,11 @@ void PhoneBridge::Run() {
             const uint32_t sequence = r32(buf + 20);
             if (!incoming_session || !incoming_generation)
                 continue;
+            peer = incoming_peer;
+            peer_len = incoming_peer_len;
+#if CONFIG_GATEWAY_MANAGER
+            gateway_manager_note_media(false);
+#endif
             if (!have_session || incoming_session != session || incoming_generation != generation) {
                 // Startup/idle handling can lower Wi-Fi power after this task starts.
                 Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
@@ -157,6 +181,7 @@ void PhoneBridge::Run() {
                 sequence_gaps = reordered = queue_drops = 0;
                 last_rx_us = max_gap_us = 0;
                 tx_seq = 0;
+                uplink_pending.clear();
                 for (auto& pending : prebuffer)
                     pending.reset();
                 prebuffer_count = 0;
@@ -234,7 +259,7 @@ void PhoneBridge::Run() {
             const int16_t* packet_pcm = reinterpret_cast<const int16_t*>(packet->payload.data());
             uplink_pending.insert(uplink_pending.end(), packet_pcm, packet_pcm + samples);
             const size_t out_samples = peer_rate == 16000 ? kFrame16 : kFrame8;
-            while (uplink_pending.size() >= (peer_rate == 16000 ? kFrame16 : kFrame8)) {
+            while (uplink_pending.size() >= kFrame16) {
                 uint8_t out[672]{};
                 std::memcpy(out, "HFAP", 4);
                 out[4] = 1;
@@ -259,21 +284,25 @@ void PhoneBridge::Run() {
                 }
                 const int sent = sendto(fd, out, kHeader + out_samples * 2, 0,
                                         reinterpret_cast<sockaddr*>(&peer), peer_len);
+#if CONFIG_GATEWAY_MANAGER
+                if (sent == int(kHeader + out_samples * 2))
+                    gateway_manager_note_media(true);
+#endif
                 if (sent != int(kHeader + out_samples * 2) &&
                     (tx_packets == 0 || (tx_packets % 50) == 0))
                     ESP_LOGW(TAG, "UDP send failed errno=%d sent=%d len=%u", errno, sent,
                              unsigned(kHeader + out_samples * 2));
-                uplink_pending.erase(uplink_pending.begin(),
-                                     uplink_pending.begin() + (peer_rate == 16000 ? kFrame16 : kFrame8));
+                uplink_pending.erase(uplink_pending.begin(), uplink_pending.begin() + kFrame16);
                 tx_seq++;
                 if (++tx_packets == 1 || (tx_packets % 250) == 0) {
-                    const uint32_t rms = tx_window_samples
-                                             ? static_cast<uint32_t>(std::sqrt(
-                                                   static_cast<double>(tx_window_sum_sq) /
-                                                   tx_window_samples))
-                                             : 0;
-                    ESP_LOGI(TAG, "TX packets=%" PRIu32 " rate=%u rms=%" PRIu32
-                                  " peak=%d samples=%" PRIu32,
+                    const uint32_t rms =
+                        tx_window_samples
+                            ? static_cast<uint32_t>(std::sqrt(
+                                  static_cast<double>(tx_window_sum_sq) / tx_window_samples))
+                            : 0;
+                    ESP_LOGI(TAG,
+                             "TX packets=%" PRIu32 " rate=%u rms=%" PRIu32
+                             " peak=%d samples=%" PRIu32,
                              tx_packets, peer_rate, rms, tx_window_peak, tx_window_samples);
                     tx_window_samples = 0;
                     tx_window_sum_sq = 0;

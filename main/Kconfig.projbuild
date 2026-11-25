@@ -24,6 +24,23 @@ config PHONE_BRIDGE
         Receives 8 kHz PCM from the classic ESP32 HFP gateway over UDP and
         plays it through the normal audio service. Microphone PCM is sent back.
 
+config GATEWAY_MANAGER
+    bool "Enable BLE commissioning and automatic phone gateway discovery"
+    default y if BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5B
+    depends on PHONE_BRIDGE && !USE_ESP_BLUFI_WIFI_PROVISIONING && !BT_NIMBLE_ENABLED
+    select BT_BLE_ENABLED
+    select BT_BLE_42_FEATURES_SUPPORTED
+    select BT_BLE_42_ADV_EN
+    select BT_BLE_42_SCAN_EN
+    select BT_GATTC_ENABLE
+    select BT_GATTS_ENABLE
+    select BT_BLE_SMP_ENABLE
+
+config GATEWAY_DEBUG_COMMANDS
+    bool "Enable development gateway commands"
+    depends on GATEWAY_MANAGER
+    default n
+
 choice
     prompt "Flash Assets"
     default FLASH_DEFAULT_ASSETS if !USE_EMOTE_MESSAGE_STYLE

@@ -35,6 +35,8 @@ Read the closest existing implementation before adding a new one. Prefer the nar
 - Keep shared message semantics in `Protocol`; verify both transports when changing its contract.
 - Validate network input and preserve `cJSON` ownership. NVS keys are persistent API and require migration when changed.
 - Guard target-specific features with Kconfig/component rules. Do not assume every target has PSRAM or S3/P4 resources.
+- On boards with initialized PSRAM, prefer explicit PSRAM allocation for eligible large buffers and component-supported external allocations. Preserve internal SRAM for capability-constrained resources; do not move DMA descriptors, cache-disabled/ISR data, or task stacks blindly. Follow `docs/memory-allocation.md` when adding or changing allocations.
+- For allocation failures, record the requested size/capabilities, internal free/minimum/largest block, and PSRAM free/largest block. Total free heap alone is insufficient; validate memory changes with the normal audio/Bluetooth features enabled.
 - Do not manually edit generated/vendor output: `build/`, `releases/`, `managed_components/`, `components/`, `sdkconfig*`, `main/assets/lang_config.h`, or generated mmap headers.
 - Format only touched C/C++ files with the repository `.clang-format`; avoid unrelated mass formatting.
 
@@ -80,12 +82,14 @@ The build script changes local `sdkconfig` and build state. Do not assume the bu
 - Audio changes: verify capture, playback, wake/VAD, interruption, reconnect, and applicable AEC modes.
 - UI/assets changes: verify applicable no-display/OLED/LVGL paths and partition size.
 - Always report what was tested and what still needs physical hardware. A successful build is not hardware validation.
+- For ESP32/S3 phone bridge tests, follow `designv1/esp32-hfp-s3-realtime-design.md` section 16. A playback, loopback, or packet-counter PASS never implies full duplex speech or phone lifecycle acceptance.
 
 ## Authoritative Documentation
 
 - Overview and SDK policy: `README.md`
 - Board guide: `docs/custom-board.md`
 - Audio design: `main/audio/README.md`
+- Memory allocation and PSRAM policy: `docs/memory-allocation.md`
 - Code style: `docs/code_style.md`
 - Protocols: `docs/websocket.md`, `docs/mqtt-udp.md`, `docs/mcp-protocol.md`
 - CI matrix: `.github/workflows/build.yml`
