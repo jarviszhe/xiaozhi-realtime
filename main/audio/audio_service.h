@@ -154,6 +154,11 @@ public:
     void EnablePcmCapture(bool enable);
     void SetPcmTransport(bool enabled) { pcm_transport_.store(enabled); }
     bool IsPcmTransport() const { return pcm_transport_.load(); }
+#if CONFIG_PHONE_BRIDGE
+    // Serial-only, bounded PSRAM diagnostic. Captures PCM submitted to the codec,
+    // not the DAC output or acoustic sound. Allocation/export never run in audio tasks.
+    bool HandlePhoneDebugCommand(const char* line);
+#endif
 
     void SetCallbacks(AudioServiceCallbacks& callbacks);
 
@@ -231,6 +236,19 @@ private:
 #endif
     std::atomic<bool> service_stopped_{true};
     std::atomic<bool> pcm_transport_{false};
+#if CONFIG_PHONE_BRIDGE
+    std::mutex phone_capture_mutex_;
+    uint8_t* phone_capture_ = nullptr;
+    size_t phone_capture_used_ = 0;
+    size_t phone_capture_goal_ = 0;
+    unsigned phone_capture_rate_ = 0;
+    uint32_t phone_capture_generation_ = 0;
+    int64_t phone_capture_deadline_us_ = 0;
+    bool phone_capture_active_ = false;
+    std::atomic<bool> phone_capture_microphone_{false};
+    std::atomic<uint32_t> phone_capture_contention_{0};
+    void CapturePhonePcm(const int16_t* pcm, size_t samples, uint32_t generation, bool microphone);
+#endif
     std::atomic<bool> audio_input_need_warmup_{false};
 
     esp_timer_handle_t audio_power_timer_ = nullptr;

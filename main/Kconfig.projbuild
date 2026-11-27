@@ -24,6 +24,14 @@ config PHONE_BRIDGE
         Receives 8 kHz PCM from the classic ESP32 HFP gateway over UDP and
         plays it through the normal audio service. Microphone PCM is sent back.
 
+config PHONE_BRIDGE_UART
+    bool "Use dedicated UART media link during HFP calls"
+    default n
+    depends on PHONE_BRIDGE
+    help
+        Optional wired experiment. Both boards must select UART media and be
+        physically connected. Leave disabled for normal wireless UDP media.
+
 config GATEWAY_MANAGER
     bool "Enable BLE commissioning and automatic phone gateway discovery"
     default y if BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5B

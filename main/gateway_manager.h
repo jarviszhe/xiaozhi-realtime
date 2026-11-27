@@ -20,6 +20,8 @@ esp_err_t gateway_manager_start(bool host, const gateway_manager_hooks_t* hooks)
 bool gateway_manager_command(const char* line);
 bool gateway_manager_accepts(uint32_t ip);
 bool gateway_manager_ready(void);
+// Peer receive capabilities from the authenticated control channel; legacy=PCM.
+uint8_t gateway_manager_peer_audio_codecs(void);
 void gateway_manager_note_media(bool transmit);
 #ifdef __cplusplus
 }

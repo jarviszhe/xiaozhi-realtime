@@ -10,6 +10,10 @@ public:
 private:
     static void Task(void* arg);
     void Run();
+#if CONFIG_PHONE_BRIDGE_UART
+    void RunUart();
+#endif
+    void RunUdp();
     AudioService& audio_;
     TaskHandle_t task_handle_ = nullptr;
 };

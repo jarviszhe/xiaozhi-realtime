@@ -1,6 +1,16 @@
 #include "audio_service.h"
 #include <esp_log.h>
 #include <cstring>
+#if CONFIG_PHONE_BRIDGE
+#include <inttypes.h>
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include "esp_crc.h"
+#include "esp_heap_caps.h"
+#include "assets/lang_config.h"
+#include "mbedtls/base64.h"
+#endif
 #if CONFIG_ALIYUN_REALTIME
 #include "realtime/debug_trace.h"
 #endif
@@ -31,6 +41,9 @@
 AudioService::AudioService() { event_group_ = xEventGroupCreate(); }
 
 AudioService::~AudioService() {
+#if CONFIG_PHONE_BRIDGE
+    heap_caps_free(phone_capture_);
+#endif
     if (event_group_ != nullptr) {
         vEventGroupDelete(event_group_);
     }
@@ -120,8 +133,7 @@ void AudioService::Initialize(AudioCodec* codec) {
 void AudioService::Start() {
     service_stopped_.store(false);
     xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING | AS_EVENT_WAKE_WORD_RUNNING |
-                                           AS_EVENT_AUDIO_PROCESSOR_RUNNING |
-                                           AS_EVENT_PCM_CAPTURE |
+                                           AS_EVENT_AUDIO_PROCESSOR_RUNNING | AS_EVENT_PCM_CAPTURE |
                                            AS_EVENT_AUDIO_INPUT_STOP_REQUEST);
 
     esp_timer_start_periodic(audio_power_timer_, 1000000);
@@ -294,6 +306,16 @@ void AudioService::AudioInputTask() {
                         data[i] = data[i * channels];
                     data.resize(samples);
                 }
+#if CONFIG_PHONE_BRIDGE
+                if (phone_capture_microphone_.load()) {
+                    uint32_t generation;
+                    {
+                        std::lock_guard<std::mutex> guard(audio_queue_mutex_);
+                        generation = playback_generation_;
+                    }
+                    CapturePhonePcm(data.data(), data.size(), generation, true);
+                }
+#endif
                 PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
                 continue;
             }
@@ -354,6 +376,12 @@ void AudioService::AudioInputTask() {
 }
 
 void AudioService::AudioOutputTask() {
+#if CONFIG_PHONE_BRIDGE
+    uint32_t phone_writes = 0;
+    uint64_t phone_samples = 0, phone_sum_squares = 0;
+    int64_t previous_write_end = 0, phone_max_gap_us = 0, phone_max_write_us = 0;
+    int phone_peak = 0;
+#endif
     while (true) {
         std::unique_lock<std::mutex> lock(audio_queue_mutex_);
         audio_queue_cv_.wait(
@@ -394,7 +422,43 @@ void AudioService::AudioOutputTask() {
             }
             const size_t count = std::min(chunk_samples, task.pcm.size() - offset);
             chunk.assign(task.pcm.begin() + offset, task.pcm.begin() + offset + count);
+#if CONFIG_PHONE_BRIDGE
+            const bool phone_pcm = pcm_transport_.load();
+            int64_t write_begin = 0;
+            if (phone_pcm) {
+                write_begin = esp_timer_get_time();
+                if (previous_write_end)
+                    phone_max_gap_us = std::max(phone_max_gap_us, write_begin - previous_write_end);
+                CapturePhonePcm(chunk.data(), chunk.size(), task.playback_generation, false);
+                for (int16_t sample : chunk) {
+                    phone_sum_squares += int64_t(sample) * sample;
+                    phone_peak = std::max(phone_peak, std::abs(int(sample)));
+                }
+                phone_samples += chunk.size();
+            }
+#endif
             codec_->OutputData(chunk);
+#if CONFIG_PHONE_BRIDGE
+            if (phone_pcm) {
+                previous_write_end = esp_timer_get_time();
+                phone_max_write_us = std::max(phone_max_write_us, previous_write_end - write_begin);
+                if (++phone_writes == 1 || phone_writes % 250 == 0) {
+                    ESP_LOGI(
+                        TAG,
+                        "PHONE_OUTPUT writes=%" PRIu32 " samples=%" PRIu64 " mean_square=%" PRIu64
+                        " peak=%d rate=%d enabled=%u"
+                        " max_gap_us=%" PRId64 " max_write_us=%" PRId64
+                        " capture_contention=%" PRIu32,
+                        phone_writes, phone_samples,
+                        phone_samples ? phone_sum_squares / phone_samples : 0, phone_peak,
+                        codec_->output_sample_rate(), codec_->output_enabled(), phone_max_gap_us,
+                        phone_max_write_us, phone_capture_contention_.load());
+                    phone_samples = phone_sum_squares = 0;
+                    phone_peak = 0;
+                    phone_max_gap_us = phone_max_write_us = 0;
+                }
+            }
+#endif
         }
         // OutputData returns when queued into I2S, not when the last sample is audible.
         bool tail_pending;
@@ -436,6 +500,150 @@ void AudioService::AudioOutputTask() {
 
     ESP_LOGW(TAG, "Audio output task stopped");
 }
+
+#if CONFIG_PHONE_BRIDGE
+void AudioService::CapturePhonePcm(const int16_t* pcm, size_t samples, uint32_t generation,
+                                   bool microphone) {
+    if (phone_capture_microphone_.load() != microphone)
+        return;
+    std::unique_lock<std::mutex> lock(phone_capture_mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        phone_capture_contention_.fetch_add(1);
+        return;
+    }
+    if (!phone_capture_active_ || phone_capture_microphone_.load() != microphone)
+        return;
+    if (generation != phone_capture_generation_ ||
+        esp_timer_get_time() >= phone_capture_deadline_us_) {
+        phone_capture_active_ = false;
+        return;
+    }
+    size_t bytes = std::min(samples * sizeof(int16_t), phone_capture_goal_ - phone_capture_used_);
+    std::memcpy(phone_capture_ + phone_capture_used_, pcm, bytes);
+    phone_capture_used_ += bytes;
+    phone_capture_active_ = phone_capture_used_ < phone_capture_goal_;
+}
+
+bool AudioService::HandlePhoneDebugCommand(const char* line) {
+    if (std::strcmp(line, "phone prompt") == 0) {
+        if (!pcm_transport_.load() || !IsPlaybackIdle()) {
+            puts("PHONE_PROMPT_ERROR requires_idle_phone_playback");
+            return true;
+        }
+        // Fixed local source for acoustic A/B tests, independent of HFP/UDP.
+        // Run between media sessions; it deliberately uses normal playback.
+        PlaySound(Lang::Sounds::OGG_WIFICONFIG);
+        puts("PHONE_PROMPT queued source=builtin_wificonfig scope=local_speaker_control");
+        return true;
+    }
+    if (std::strncmp(line, "phone capture ", 14))
+        return false;
+    const char* argument = line + 14;
+    if (std::strcmp(argument, "stop") == 0) {
+        std::lock_guard<std::mutex> lock(phone_capture_mutex_);
+        phone_capture_active_ = false;
+        printf("PHONE_CAPTURE stopped bytes=%u goal=%u contention=%" PRIu32 "\n",
+               unsigned(phone_capture_used_), unsigned(phone_capture_goal_),
+               phone_capture_contention_.load());
+        return true;
+    }
+    if (std::strcmp(argument, "dump") == 0) {
+        uint8_t* captured;
+        size_t bytes, goal;
+        unsigned rate;
+        uint32_t generation;
+        {
+            std::lock_guard<std::mutex> lock(phone_capture_mutex_);
+            if (phone_capture_active_ || !phone_capture_) {
+                puts("PHONE_CAPTURE_ERROR stop_capture_before_dump");
+                return true;
+            }
+            captured = phone_capture_;
+            bytes = phone_capture_used_;
+            goal = phone_capture_goal_;
+            rate = phone_capture_rate_;
+            generation = phone_capture_generation_;
+            phone_capture_ = nullptr;
+            phone_capture_used_ = phone_capture_goal_ = 0;
+        }
+        // Buffer detached under the lock; neither audio nor the main loop waits
+        // for USB output. Only the dedicated serial task performs this export.
+        printf("PCM_BEGIN rate=%u bytes=%u generation=%" PRIu32 " encoding=base64z goal=%u\n", rate,
+               unsigned(bytes), generation, unsigned(goal));
+        for (size_t offset = 0; offset < bytes; offset += 192) {
+            unsigned char encoded[257];
+            size_t written = 0;
+            const size_t count = std::min(size_t(192), bytes - offset);
+            if (std::all_of(captured + offset, captured + offset + count,
+                            [](uint8_t sample) { return sample == 0; })) {
+                printf("PCMZ %u %u\n", unsigned(offset), unsigned(count));
+                continue;
+            }
+            if (mbedtls_base64_encode(encoded, sizeof(encoded), &written, captured + offset,
+                                      count)) {
+                puts("PHONE_CAPTURE_ERROR encoding_failed");
+                heap_caps_free(captured);
+                return true;
+            }
+            printf("PCM64 %u %.*s\n", unsigned(offset), int(written), encoded);
+        }
+        printf("PCM_END crc32=%08" PRIx32 "\n", esp_crc32_le(0, captured, bytes));
+        heap_caps_free(captured);
+        return true;
+    }
+    const bool microphone = std::strncmp(argument, "mic ", 4) == 0;
+    if (microphone)
+        argument += 4;
+    unsigned duration;
+    char extra;
+    if (std::sscanf(argument, "%u%c", &duration, &extra) != 1 || !duration || duration > 60000 ||
+        !codec_ || !pcm_transport_.load() || (!microphone && codec_->output_channels() != 1)) {
+        puts("PHONE_CAPTURE_ERROR expected_1_to_60000_ms_mono_phone_transport");
+        return true;
+    }
+    const unsigned rate = microphone ? 16000 : codec_->output_sample_rate();
+    const size_t bytes = size_t(rate) * duration / 1000 * sizeof(int16_t);
+    constexpr uint32_t caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+    uint8_t* buffer = nullptr;
+    if (rate && rate <= 48000 && bytes && bytes <= 4 * 1024 * 1024)
+        buffer = static_cast<uint8_t*>(heap_caps_malloc(bytes, caps));
+    if (!buffer) {
+        constexpr uint32_t internal = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+        ESP_LOGW(TAG,
+                 "PHONE_CAPTURE allocation_failed bytes=%u caps=0x%" PRIx32
+                 " internal_free=%u min=%u largest=%u psram_free=%u largest=%u",
+                 unsigned(bytes), caps, unsigned(heap_caps_get_free_size(internal)),
+                 unsigned(heap_caps_get_minimum_free_size(internal)),
+                 unsigned(heap_caps_get_largest_free_block(internal)),
+                 unsigned(heap_caps_get_free_size(caps)),
+                 unsigned(heap_caps_get_largest_free_block(caps)));
+        return true;
+    }
+    uint32_t generation;
+    {
+        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+        generation = playback_generation_;
+    }
+    uint8_t* previous;
+    {
+        std::lock_guard<std::mutex> lock(phone_capture_mutex_);
+        previous = phone_capture_;
+        phone_capture_ = buffer;
+        phone_capture_used_ = 0;
+        phone_capture_goal_ = bytes;
+        phone_capture_rate_ = rate;
+        phone_capture_microphone_.store(microphone);
+        phone_capture_generation_ = generation;
+        phone_capture_deadline_us_ = esp_timer_get_time() + int64_t(duration) * 1000;
+        phone_capture_contention_.store(0);
+        phone_capture_active_ = true;
+    }
+    heap_caps_free(previous);
+    printf("PHONE_CAPTURE started ms=%u bytes=%u rate=%u generation=%" PRIu32 " source=%s\n",
+           duration, unsigned(bytes), rate, generation, microphone ? "mic" : "playback");
+    return true;
+}
+#endif
 
 void AudioService::OpusCodecTask() {
     while (true) {

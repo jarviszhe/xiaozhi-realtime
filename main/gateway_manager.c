@@ -276,6 +276,10 @@ static bool wifi_online(void) {
 }
 static void peer(uint32_t ip, bool ready) {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (!ready || !s_ready || s_peer_ip != ip) {
+        s_have_remote = false;
+        memset(&s_remote_status, 0, sizeof(s_remote_status));
+    }
     s_peer_ip = ready ? ip : 0;
     s_ready = ready;
     xSemaphoreGive(s_mutex);
@@ -297,6 +301,14 @@ bool gateway_manager_ready(void) {
     bool ready = s_ready;
     xSemaphoreGive(s_mutex);
     return ready;
+}
+uint8_t gateway_manager_peer_audio_codecs(void) {
+    if (!s_mutex)
+        return 1;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    uint8_t codecs = s_ready && s_have_remote ? s_remote_status.reserved[1] : 0;
+    xSemaphoreGive(s_mutex);
+    return codecs ? (codecs & 3) : 1;
 }
 static void status(void) {
     char id[16], other[16], address[16];
@@ -859,15 +871,34 @@ static void process_command(event_t* e) {
 // TCP owns its own worker: finite timeouts never block BLE/button handling.
 static bool transfer(int fd, void* data, size_t size, bool writing) {
     size_t offset = 0;
-    int64_t until = now_ms() + 6000;
+    int64_t started = now_ms();
+    int64_t until = started + 6000;
+    int last_error = 0;
     while (offset < size && now_ms() < until) {
         int n = writing ? send(fd, (uint8_t*)data + offset, size - offset, 0)
                         : recv(fd, (uint8_t*)data + offset, size - offset, 0);
         if (n > 0)
             offset += n;
-        else if (!n || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
-            return false;
+        else {
+            last_error = n < 0 ? errno : 0;
+            if (!n || (last_error != EAGAIN && last_error != EWOULDBLOCK && last_error != EINTR)) {
+                ESP_LOGW(
+                    TAG,
+                    "control transfer op=%s result=%s bytes=%u/%u errno=%d elapsed_ms=%" PRId64,
+                    writing ? "send" : "recv", n == 0 ? "eof" : "error", (unsigned)offset,
+                    (unsigned)size, last_error, now_ms() - started);
+                return false;
+            }
+            // Accepted socket flags can differ across lwIP versions. Keep a
+            // nonblocking EAGAIN path from busy-spinning for the whole deadline.
+            vTaskDelay(1);
+        }
     }
+    if (offset != size)
+        ESP_LOGW(TAG,
+                 "control transfer op=%s result=timeout bytes=%u/%u errno=%d elapsed_ms=%" PRId64,
+                 writing ? "send" : "recv", (unsigned)offset, (unsigned)size, last_error,
+                 now_ms() - started);
     return offset == size;
 }
 static void packet_init(control_packet_t* p, int type, const binding_t* binding) {
@@ -877,7 +908,8 @@ static void packet_init(control_packet_t* p, int type, const binding_t* binding)
     p->version = 1;
     p->port = GM_MEDIA_PORT;
     p->rate = 16000;
-    p->reserved[0] = 3;  // PCM16 mono, 8 kHz and 16 kHz capabilities.
+    p->reserved[0] = 3;               // PCM16 mono, 8 kHz and 16 kHz capabilities.
+    p->reserved[1] = 3;  // Both roles accept PCM and independent IMA ADPCM media.
     memcpy(p->node, s_id, 6);
     memcpy(p->target, binding->peer, 6);
     if (s_hooks.media) {
@@ -902,13 +934,25 @@ static bool control_send(int fd, control_packet_t* p, const binding_t* binding) 
 }
 static bool control_receive(int fd, control_packet_t* p, int type, bool authenticated,
                             const binding_t* binding) {
-    if (!transfer(fd, p, sizeof(*p), false) || memcmp(p->magic, "GWC1", 4) || p->version != 1 ||
-        p->type != type || p->port != GM_MEDIA_PORT || memcmp(p->node, binding->peer, 6) ||
-        memcmp(p->target, s_id, 6))
+    if (!transfer(fd, p, sizeof(*p), false)) {
+        ESP_LOGW(TAG, "control receive failed expected_type=%d", type);
         return false;
-    return !authenticated || proof(binding->key, p, offsetof(control_packet_t, proof), p->proof);
+    }
+    if (memcmp(p->magic, "GWC1", 4) || p->version != 1 || p->type != type ||
+        p->port != GM_MEDIA_PORT || memcmp(p->node, binding->peer, 6) ||
+        memcmp(p->target, s_id, 6)) {
+        ESP_LOGW(TAG, "control header rejected expected_type=%d actual_type=%u", type, p->type);
+        return false;
+    }
+    bool valid =
+        !authenticated || proof(binding->key, p, offsetof(control_packet_t, proof), p->proof);
+    if (!valid)
+        ESP_LOGW(TAG, "control proof rejected expected_type=%d", type);
+    return valid;
 }
-static void session(int fd, uint32_t ip, const binding_t* binding) {
+static bool session(int fd, uint32_t ip, const binding_t* binding) {
+    bool authenticated_ready = false;
+    uint32_t heartbeat = 0;
     struct timeval timeout = {.tv_usec = 250000};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
@@ -946,6 +990,7 @@ static void session(int fd, uint32_t ip, const binding_t* binding) {
         if (!control_send(fd, &out, binding))
             goto done;
     }
+    authenticated_ready = true;
     peer(ip, true);
     event_t connected = {.kind = E_LINK_READY};
     enqueue(&connected);
@@ -965,8 +1010,12 @@ static void session(int fd, uint32_t ip, const binding_t* binding) {
                 break;
         }
         if (in.sequence != seq || memcmp(in.client_nonce, client, 16) ||
-            memcmp(in.server_nonce, server, 16))
+            memcmp(in.server_nonce, server, 16)) {
+            ESP_LOGW(TAG, "control heartbeat rejected expected_seq=%" PRIu32 " actual_seq=%" PRIu32,
+                     seq, in.sequence);
             break;
+        }
+        heartbeat = seq;
         s_last_link = now_ms();
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         s_remote_status = in;
@@ -986,12 +1035,20 @@ static void session(int fd, uint32_t ip, const binding_t* binding) {
         vTaskDelay(pdMS_TO_TICKS(s_host ? 2000 : 10));
     }
 done:
+    ESP_LOGW(TAG, "control closed role=%s authenticated=%d heartbeat=%" PRIu32 " age_ms=%" PRId64,
+             s_host ? "s3" : "gateway", authenticated_ready, heartbeat,
+             authenticated_ready ? now_ms() - atomic_load(&s_last_link) : -1);
     peer(0, false);
     close(fd);
     event_t lost = {.kind = E_LINK_LOST};
     enqueue(&lost);
+    return authenticated_ready;
 }
 static void control_worker(void* arg) {
+    // RAM-only last authenticated address. Always repeat the full handshake.
+    uint32_t cached_ip = 0;
+    uint8_t cached_peer[6] = {0};
+    unsigned reconnect_attempt = 0;
     int64_t mdns_retry_at = 0;
     uint32_t mdns_retry_ms = 1000;
     while (true) {
@@ -1049,10 +1106,15 @@ static void control_worker(void* arg) {
         if (s_host) {
             if (s_request)
                 continue;
+            if (memcmp(cached_peer, binding.peer, sizeof(cached_peer))) {
+                cached_ip = 0;
+                memcpy(cached_peer, binding.peer, sizeof(cached_peer));
+            }
+            bool use_cached = cached_ip && (++reconnect_attempt & 1);
+            uint32_t ip = use_cached ? cached_ip : 0;
             mdns_result_t* results = NULL;
-            if (mdns_query_ptr("_hfp-gw", "_tcp", 1000, 8, &results) != ESP_OK)
+            if (!use_cached && mdns_query_ptr("_hfp-gw", "_tcp", 1000, 8, &results) != ESP_OK)
                 continue;
-            uint32_t ip = 0;
             char wanted[16];
             id_text(binding.peer, wanted);
             for (mdns_result_t* r = results; r; r = r->next) {
@@ -1088,10 +1150,16 @@ static void control_worker(void* arg) {
                     result = -1;
             }
             fcntl(fd, F_SETFL, flags);
-            if (!result)
-                session(fd, ip, &binding);
-            else
+            if (!result) {
+                ESP_LOGI(TAG, "control reconnect address_source=%s",
+                         use_cached ? "authenticated_cache" : "mdns");
+                if (session(fd, ip, &binding))
+                    cached_ip = ip;
+            } else {
+                ESP_LOGW(TAG, "control connect failed address_source=%s result=%d",
+                         use_cached ? "authenticated_cache" : "mdns", result);
                 close(fd);
+            }
         } else {
             if (s_listener < 0) {
                 s_listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);

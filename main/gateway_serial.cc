@@ -5,6 +5,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "gateway_manager.h"
+#if CONFIG_PHONE_BRIDGE
+#include "application.h"
+#endif
 
 namespace {
 void ConsoleTask(void*) {
@@ -19,6 +22,13 @@ void ConsoleTask(void*) {
         if (c == '\r' || c == '\n') {
             if (used && !overflow) {
                 line[used] = 0;
+#if CONFIG_PHONE_BRIDGE
+                if (Application::GetInstance().GetAudioService().HandlePhoneDebugCommand(line)) {
+                    used = 0;
+                    overflow = false;
+                    continue;
+                }
+#endif
                 if (!gateway_manager_command(line))
                     puts("GATEWAY_ERROR expected_gateway_command");
             } else if (overflow) {
