@@ -1,6 +1,7 @@
 #include "aliyun_protocol.h"
 #include "audio_base64.h"
 
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <cJSON.h>
 #include <mbedtls/base64.h>
@@ -19,6 +20,21 @@ constexpr char kTag[] = "AliyunRealtime";
 constexpr EventBits_t kCreated = BIT0;
 constexpr EventBits_t kUpdated = BIT1;
 constexpr EventBits_t kError = BIT2;
+
+void LogTlsMemory(const char* phase) {
+    constexpr uint32_t internal = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    constexpr uint32_t external = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+    ESP_LOGI(kTag,
+             "TLS_MEMORY phase=%s internal_free=%u internal_min=%u internal_largest=%u dma_free=%u "
+             "dma_largest=%u psram_free=%u psram_largest=%u",
+             phase, (unsigned)heap_caps_get_free_size(internal),
+             (unsigned)heap_caps_get_minimum_free_size(internal),
+             (unsigned)heap_caps_get_largest_free_block(internal),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_free_size(external),
+             (unsigned)heap_caps_get_largest_free_block(external));
+}
 
 const char* StringValue(const cJSON* object, const char* name) {
     const cJSON* item = cJSON_GetObjectItemCaseSensitive(object, name);
@@ -103,6 +119,13 @@ bool AliyunProtocol::OpenAudioChannel() {
             HandleEvent(data, len, generation);
         }
     });
+    socket->OnError([this, generation](const NetworkError& error) {
+        if (generation != connection_generation_.load())
+            return;
+        ESP_LOGE(kTag, "WebSocket transport error: %s", error.ToString().c_str());
+        LogTlsMemory("transport_error");
+        xEventGroupSetBits(ready_events_, kError);
+    });
     std::weak_ptr<WebSocket> weak = socket;
     socket->OnPing([weak](const char* data, size_t len) {
         Application::GetInstance().Schedule([weak, value = std::string(data, len)]() {
@@ -126,8 +149,12 @@ bool AliyunProtocol::OpenAudioChannel() {
             on_audio_channel_closed_();
     });
     const auto url = config_.WebSocketUrl();
+    ESP_LOGI(kTag, "Opening WebSocket url=%s direct=%d", url.c_str(),
+             config_.websocket_url.empty() ? 1 : 0);
+    LogTlsMemory("before_connect");
     auto connected = socket->Connect(url.c_str());
     if (!connected) {
+        LogTlsMemory("connect_failed");
         ESP_LOGE(kTag, "WebSocket connect failed: %s", connected.error().ToString().c_str());
         CloseAudioChannel();
         return false;
@@ -150,6 +177,7 @@ bool AliyunProtocol::OpenAudioChannel() {
     }
     if (on_audio_channel_opened_)
         on_audio_channel_opened_();
+    LogTlsMemory("channel_ready");
     return true;
 }
 
@@ -266,6 +294,10 @@ void AliyunProtocol::HandleEvent(const char* data, size_t size, uint32_t generat
         return;
     }
     DebugTrace::Instance().WebSocketRx(data, size);
+    if (strstr(type, ".delta") == nullptr)
+        ESP_LOGI(kTag, "Cloud event type=%s bytes=%u", type, (unsigned)size);
+    else
+        ESP_LOGD(kTag, "Cloud event type=%s bytes=%u", type, (unsigned)size);
     std::lock_guard<std::mutex> lock(response_mutex_);
     if (generation != connection_generation_.load()) {
         cJSON_Delete(root);
@@ -279,6 +311,9 @@ void AliyunProtocol::HandleEvent(const char* data, size_t size, uint32_t generat
         xEventGroupSetBits(ready_events_, kCreated);
     } else if (strcmp(type, "session.updated") == 0) {
         xEventGroupSetBits(ready_events_, kUpdated);
+    } else if (strcmp(type, "input_audio_buffer.speech_stopped") == 0) {
+        if (on_speech_stopped_)
+            on_speech_stopped_();
     } else if (strcmp(type, "input_audio_buffer.committed") == 0) {
         if (waiting_commit_.exchange(false)) {
             Application::GetInstance().Schedule([weak = weak_from_this(), generation]() {
@@ -362,7 +397,8 @@ void AliyunProtocol::HandleEvent(const char* data, size_t size, uint32_t generat
             cJSON_Delete(root);
             return;
         }
-        ESP_LOGE(kTag, "Cloud error: %s", code ? code : "unknown");
+        ESP_LOGE(kTag, "Cloud error: code=%s event_id=%s message=%s", code ? code : "unknown",
+                 event_id ? event_id : "", message ? message : "");
         xEventGroupSetBits(ready_events_, kError);
         SetError(code ? code : "Aliyun realtime error");
     }

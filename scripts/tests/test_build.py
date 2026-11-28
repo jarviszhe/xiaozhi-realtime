@@ -768,7 +768,7 @@ class PreviewTargetTests(unittest.TestCase):
     def test_stage_marker_is_only_emitted_when_enabled(self):
         output = io.StringIO()
         with (
-            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(build.os, "environ", {}),
             contextlib.redirect_stdout(output),
         ):
             build._emit_build_stage("compiling")
@@ -776,10 +776,9 @@ class PreviewTargetTests(unittest.TestCase):
 
         output = io.StringIO()
         with (
-            mock.patch.dict(
-                os.environ,
+            mock.patch.object(
+                build.os, "environ",
                 {"XIAOZHI_BUILD_STAGES": "true"},
-                clear=True,
             ),
             contextlib.redirect_stdout(output),
         ):
@@ -850,8 +849,7 @@ class TargetConfigurationTests(unittest.TestCase):
     def test_configure_build_uses_all_cmake_values_in_one_run(self):
         previous_cwd = Path.cwd()
         try:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                os.chdir(temp_dir)
+            with tempfile.TemporaryDirectory() as temp_dir, contextlib.chdir(temp_dir):
                 Path("sdkconfig").write_text(
                     'CONFIG_IDF_TARGET="esp32s3"\nCONFIG_OLD_VARIANT=y\n',
                     encoding="utf-8",
@@ -895,8 +893,7 @@ class TargetConfigurationTests(unittest.TestCase):
     def test_configure_build_replaces_stale_sdkconfig_backup(self):
         previous_cwd = Path.cwd()
         try:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                os.chdir(temp_dir)
+            with tempfile.TemporaryDirectory() as temp_dir, contextlib.chdir(temp_dir):
                 Path("sdkconfig").write_text(
                     'CONFIG_IDF_TARGET="esp32s3"\n',
                     encoding="utf-8",
@@ -1115,8 +1112,7 @@ class BuildOptionTests(unittest.TestCase):
     def test_configured_build_options_are_verified(self):
         previous_cwd = Path.cwd()
         try:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                os.chdir(temp_dir)
+            with tempfile.TemporaryDirectory() as temp_dir, contextlib.chdir(temp_dir):
                 Path("sdkconfig").write_text(
                     "CONFIG_LANGUAGE_EN_US=y\n",
                     encoding="utf-8",
@@ -1136,8 +1132,7 @@ class BuildOptionTests(unittest.TestCase):
     def test_disabled_build_options_accept_symbols_hidden_by_kconfig(self):
         previous_cwd = Path.cwd()
         try:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                os.chdir(temp_dir)
+            with tempfile.TemporaryDirectory() as temp_dir, contextlib.chdir(temp_dir):
                 Path("sdkconfig").write_text(
                     "CONFIG_SELECTED_STYLE=y\n"
                     "# CONFIG_EXPLICITLY_DISABLED is not set\n",
@@ -1855,8 +1850,7 @@ class ZipTests(unittest.TestCase):
     def test_zip_is_always_recreated(self):
         previous_cwd = Path.cwd()
         try:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                os.chdir(temp_dir)
+            with tempfile.TemporaryDirectory() as temp_dir, contextlib.chdir(temp_dir):
                 Path("build").mkdir()
                 Path("build/merged-binary.bin").write_bytes(b"new firmware")
                 Path("releases").mkdir()

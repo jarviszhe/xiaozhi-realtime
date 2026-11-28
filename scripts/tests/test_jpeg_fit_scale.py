@@ -30,6 +30,12 @@ class FitScaleTests(unittest.TestCase):
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/param.h>
+#ifndef MIN
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#endif
+#ifndef MAX
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+#endif
 
 typedef struct {
     int width;

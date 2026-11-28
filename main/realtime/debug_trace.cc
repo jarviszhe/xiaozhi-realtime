@@ -1,4 +1,5 @@
 #include "debug_trace.h"
+#include "background_work.h"
 
 #include <esp_app_desc.h>
 #include <esp_heap_caps.h>
@@ -67,15 +68,21 @@ void DebugTrace::Configure(const AliyunRealtimeConfig& config) {
             return;
         enabled_ = true;
         if (config.debug_input_pcm && config.debug_level >= 2) {
-            raw_queue_ = xQueueCreate(8, sizeof(RawBlock));
-            if (raw_queue_ && xTaskCreate(RawTask, "rt_raw", 4096, this, 1, nullptr) == pdPASS)
+            raw_queue_storage_ =
+                static_cast<uint8_t*>(heap_caps_malloc(8 * sizeof(RawBlock), kFrameCaps));
+            if (raw_queue_storage_)
+                raw_queue_ = xQueueCreateStatic(8, sizeof(RawBlock), raw_queue_storage_,
+                                                &raw_queue_control_);
+            if (raw_queue_ && StartBackgroundWork("rt_raw", 4096, 1, [this]() { RawTask(this); }))
                 input_enabled_.store(true);
+            else
+                ESP_LOGW(kTag, "Raw PCM trace unavailable");
         }
         level_ = config.debug_level;
         address_ = config.debug_address;
         started_ = true;
     }
-    if (xTaskCreate(RunTask, "rt_trace", kTaskStackBytes, this, 2, nullptr) != pdPASS) {
+    if (!StartBackgroundWork("rt_trace", kTaskStackBytes, 2, [this]() { Run(); })) {
         std::lock_guard<std::mutex> lock(mutex_);
         enabled_ = false;
         started_ = false;

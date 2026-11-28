@@ -1,4 +1,5 @@
 #include "phone_bridge.h"
+#include "call_records.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -113,6 +114,90 @@ static void upsample_to_24k(const int16_t* in, size_t samples, unsigned rate, in
         const int16_t b = in[index + 1 < samples ? index + 1 : samples - 1];
         out[i] = int16_t(int32_t(a) + (int32_t(b) - a) * frac / 24000);
     }
+}
+
+bool PhoneBridge::SetAiRoute(bool enabled) {
+    std::lock_guard<std::mutex> lock(ai_mutex_);
+    constexpr size_t capacity = 24000 * 30;
+    if (enabled && !ai_storage_) {
+        const uint32_t external = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+        const uint32_t internal = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+        ai_storage_ = static_cast<int16_t*>(heap_caps_malloc(capacity * 2, external));
+        if (!ai_storage_) {
+            ESP_LOGE(TAG,
+                     "AI buffer allocation bytes=%u caps=0x%lx internal_free=%u min=%u largest=%u "
+                     "psram_free=%u largest=%u",
+                     unsigned(capacity * 2), (unsigned long)external,
+                     unsigned(heap_caps_get_free_size(internal)),
+                     unsigned(heap_caps_get_minimum_free_size(internal)),
+                     unsigned(heap_caps_get_largest_free_block(internal)),
+                     unsigned(heap_caps_get_free_size(external)),
+                     unsigned(heap_caps_get_largest_free_block(external)));
+            return false;
+        }
+        ai_downlink_.Attach(ai_storage_, capacity);
+    }
+    ai_route_.store(enabled);
+    ++ai_epoch_;
+    ai_downlink_.Clear();
+    phone_uplink_.clear();
+    ai_played_us_ = 0;
+    ai_failure_.store(PhoneAiFailure::None);
+    if (enabled)
+        ai_rx_samples_ = ai_tx_samples_ = ai_uplink_drops_ = 0;
+    ESP_LOGI(TAG,
+             "PHONE_AI audio_route=%d epoch=%lu cloud_rx_samples=%lu hfp_tx_samples=%lu "
+             "uplink_drops=%lu",
+             enabled, (unsigned long)ai_epoch_.load(), (unsigned long)ai_rx_samples_,
+             (unsigned long)ai_tx_samples_, (unsigned long)ai_uplink_drops_);
+    return true;
+}
+
+void PhoneBridge::InvalidateAiMedia(const char* reason, PhoneAiFailure failure) {
+    std::lock_guard<std::mutex> lock(ai_mutex_);
+    if (!ai_route_.load())
+        return;
+    if (AiAudioFailed())
+        return;
+    ai_failure_.store(failure);
+    ai_downlink_.Clear();
+    phone_uplink_.clear();
+    ESP_LOGW(TAG, "PHONE_AI failure=media_changed reason=%s", reason);
+}
+
+void PhoneBridge::QueueAiDownlink(std::unique_ptr<AudioStreamPacket> packet) {
+    if (!packet || !packet->pcm || packet->sample_rate != 24000 || packet->payload.empty() ||
+        packet->payload.size() % 2)
+        return;
+    std::lock_guard<std::mutex> lock(ai_mutex_);
+    if (!ai_route_.load() || AiAudioFailed())
+        return;
+    const size_t samples = packet->payload.size() / 2;
+    if (!ai_downlink_.Push(reinterpret_cast<const int16_t*>(packet->payload.data()), samples)) {
+        ai_failure_.store(PhoneAiFailure::AudioQueueOverflow);
+        ESP_LOGE(TAG, "PHONE_AI failure=downlink_overflow queued_samples=%u incoming=%u",
+                 unsigned(ai_downlink_.size()), unsigned(samples));
+        return;
+    }
+    ai_rx_samples_ += samples;
+    if (ai_rx_samples_ == samples || ai_rx_samples_ % 24000 < samples)
+        ESP_LOGI(TAG, "PHONE_AI cloud_rx_samples=%lu queued_ms=%u", (unsigned long)ai_rx_samples_,
+                 unsigned(ai_downlink_.size() / 24));
+}
+
+std::unique_ptr<AudioStreamPacket> PhoneBridge::PopPhoneUplink() {
+    std::lock_guard<std::mutex> lock(ai_mutex_);
+    if (phone_uplink_.empty() || !ai_route_.load())
+        return nullptr;
+    auto packet = std::move(phone_uplink_.front());
+    phone_uplink_.pop_front();
+    return packet;
+}
+
+bool PhoneBridge::AiPlaybackIdle() {
+    std::lock_guard<std::mutex> lock(ai_mutex_);
+    return !ai_downlink_.size() &&
+           (!ai_played_us_ || esp_timer_get_time() - ai_played_us_ > 250000);
 }
 
 static bool resampler_selftest() {
@@ -440,8 +525,7 @@ void PhoneBridge::RunUdp() {
     // independent of the later DHCP result.
     vTaskDelay(pdMS_TO_TICKS(5000));
     audio_.DiscardUplink();
-    audio_.SetPcmTransport(true);
-    audio_.EnablePcmCapture(true);
+    audio_.EnablePcmCapture(false);
     audio_.EnableDeviceAec(false);
     Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
     int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -513,6 +597,10 @@ void PhoneBridge::RunUdp() {
     uint32_t concealed_packets = 0, rebuffer_count = 0;
     uint32_t source_concealed_packets = 0;
     std::vector<int16_t> uplink_pending;
+    PhoneRateConverter ai_input_converter, ai_output_converter;
+    unsigned ai_peer_rate = 0;
+    uint32_t route_epoch = ai_epoch_.load();
+    int16_t ai_frame[480]{}, wire_pcm[320]{};
     constexpr size_t kMaxUplinkSamples = kFrame16 * 12;
     uplink_pending.reserve(kMaxUplinkSamples + 960);
     ESP_LOGI(TAG, "PCM prebuffer_ms=160 conceal_limit_ms=100 history_caps=0x%" PRIx32,
@@ -552,6 +640,7 @@ void PhoneBridge::RunUdp() {
         // or control-link loss. UART owns its separate lifetime in RunUart().
 #if CONFIG_GATEWAY_MANAGER
         if (have_session && !gateway_manager_ready()) {
+            InvalidateAiMedia("control_lost", PhoneAiFailure::GatewayControl);
             have_session = false;
             uplink_pending.clear();
             clear_prebuffer();
@@ -560,11 +649,44 @@ void PhoneBridge::RunUdp() {
         }
 #endif
         if (have_session && last_rx_us && esp_timer_get_time() - last_rx_us > 1000000) {
+            InvalidateAiMedia("media_timeout", PhoneAiFailure::GatewayMediaTimeout);
             ESP_LOGW(TAG, "phone media expired; stop stale uplink generation=%" PRIu32, generation);
             have_session = false;
             uplink_pending.clear();
             clear_prebuffer();
             audio_.DiscardUplink();
+        }
+        const bool ai_route = ai_route_.load();
+        if (route_epoch != ai_epoch_.load()) {
+            route_epoch = ai_epoch_.load();
+            ai_peer_rate = 0;
+            uplink_pending.clear();
+            clear_prebuffer();
+            audio_.DiscardUplink();
+        }
+        bool call_active = false;
+#if CONFIG_GATEWAY_MANAGER
+        phone_status_t phone_status{};
+        int64_t phone_age_ms = 0;
+        uint32_t phone_duration_ms = 0;
+        const bool phone_fresh =
+            gateway_manager_get_phone_status(&phone_status, &phone_age_ms, &phone_duration_ms);
+        // A missed control heartbeat is unknown, not a hangup. Preserve the
+        // current call only while authenticated media is still arriving; the
+        // one-second media lease above bounds recovery on an actual link loss.
+        call_active =
+            phone_fresh ? phone_status.phase == PHONE_ACTIVE : last_call_active_ && have_session;
+#endif
+        const bool local = have_session && !ai_route && !call_active;
+        if (local_audio_.exchange(local) != local) {
+            audio_.DiscardUplink();
+            audio_.EnablePcmCapture(local);
+        }
+        if (call_active != last_call_active_) {
+            last_call_active_ = call_active;
+            if (callbacks_.on_call_active)
+                callbacks_.on_call_active(call_active);
+            ESP_LOGI(TAG, "PHONE_ROUTE call_active=%d ai_route=%d", call_active, ai_route);
         }
         // Drain a bounded burst before yielding to capture/transmit. Sleeping
         // one 10 ms tick per datagram magnifies a short scheduling stall; an
@@ -607,6 +729,9 @@ void PhoneBridge::RunUdp() {
 #endif
                 if (!have_session || incoming_session != session ||
                     incoming_generation != generation || rate != peer_rate) {
+                    if (have_session && (incoming_session != session ||
+                                         incoming_generation != generation || rate != peer_rate))
+                        InvalidateAiMedia("new_generation", PhoneAiFailure::GatewayMediaChanged);
                     // Startup/idle handling can lower Wi-Fi power after this task starts.
                     Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
                     expected_seq = sequence;
@@ -618,6 +743,7 @@ void PhoneBridge::RunUdp() {
                     next_tx_us = 0;
                     tx_adpcm_index = 32;
                     uplink_pending.clear();
+                    ai_peer_rate = 0;
                     clear_prebuffer();
                 }
                 bool late = false, large_loss = false;
@@ -657,14 +783,47 @@ void PhoneBridge::RunUdp() {
                 if (have_previous_pcm) {
                     for (uint32_t lost = 1; lost <= missing; ++lost) {
                         phone_downlink_conceal(previous_pcm.get(), decoded, frame, lost);
-                        submit_pcm(decoded);
+                        if (!ai_route && local_audio_.load())
+                            submit_pcm(decoded);
                         ++concealed_packets;
                     }
                 }
                 if (!phone_downlink_decode(buf[7], in, n - kHeader, frame,
                                            reinterpret_cast<uint8_t*>(decoded), kFrame16 * 2))
                     continue;
-                submit_pcm(decoded);
+                CallRecords::Instance().Capture(false, decoded, frame, peer_rate, sequence,
+                                                incoming_generation);
+                if (ai_route) {
+                    auto packet = std::make_unique<AudioStreamPacket>();
+                    packet->pcm = true;
+                    packet->sample_rate = 16000;
+                    packet->frame_duration = 20;
+                    const size_t output_samples = peer_rate == 16000 ? frame : frame * 2;
+                    packet->payload.resize(output_samples * sizeof(int16_t));
+                    auto* output = reinterpret_cast<int16_t*>(packet->payload.data());
+                    if (ai_peer_rate != peer_rate) {
+                        ai_input_converter.Configure(peer_rate, 16000);
+                        ai_output_converter.Configure(24000, peer_rate);
+                        ai_peer_rate = peer_rate;
+                    }
+                    if (peer_rate == 16000) {
+                        std::memcpy(output, decoded, frame * sizeof(int16_t));
+                    } else {
+                        ai_input_converter.Process(decoded, frame, output, output_samples);
+                    }
+                    std::lock_guard<std::mutex> lock(ai_mutex_);
+                    if (ai_route_.load() && route_epoch == ai_epoch_.load()) {
+                        if (phone_uplink_.size() >= 24) {
+                            phone_uplink_.pop_front();
+                            if (++ai_uplink_drops_ == 1 || ai_uplink_drops_ % 50 == 0)
+                                ESP_LOGW(TAG, "PHONE_AI uplink queue dropped=%lu",
+                                         (unsigned long)ai_uplink_drops_);
+                        }
+                        phone_uplink_.push_back(std::move(packet));
+                    }
+                } else if (local_audio_.load()) {
+                    submit_pcm(decoded);
+                }
                 std::memcpy(previous_pcm.get(), decoded, frame * sizeof(int16_t));
                 have_previous_pcm = true;
                 // Flag 2 means the sender already concealed HFP input before UDP.
@@ -687,6 +846,8 @@ void PhoneBridge::RunUdp() {
             }
         }
         for (int i = 0; i < 4; ++i) {
+            if (!local_audio_.load())
+                break;
             auto packet = audio_.PopPacketFromSendQueue();
             if (!packet || !packet->pcm || packet->sample_rate != 16000 || !have_session)
                 break;
@@ -713,8 +874,21 @@ void PhoneBridge::RunUdp() {
         // Capture arrives in 60 ms blocks. Pace the three media datagrams instead
         // of submitting them together to the Wi-Fi/Bluetooth coexistence window.
         // After a scheduling stall, permit at most one packet per task iteration.
-        if (have_session && uplink_pending.size() >= kFrame16 && tx_now_us >= next_tx_us) {
+        if (have_session && (ai_route || uplink_pending.size() >= kFrame16) &&
+            tx_now_us >= next_tx_us) {
             next_tx_us = std::max(next_tx_us + INT64_C(20000), tx_now_us + INT64_C(10000));
+            if (ai_route) {
+                std::lock_guard<std::mutex> lock(ai_mutex_);
+                const size_t samples = ai_downlink_.Pop(ai_frame, 480);
+                if (samples) {
+                    ai_played_us_ = tx_now_us;
+                    ai_tx_samples_ += samples;
+                }
+                ai_output_converter.Process(ai_frame, 480, wire_pcm, out_samples);
+            } else {
+                for (size_t i = 0; i < out_samples; ++i)
+                    wire_pcm[i] = uplink_pending[peer_rate == 16000 ? i : i * 2];
+            }
             uint8_t out[672]{};
             std::memcpy(out, "HFAP", 4);
             out[4] = 1;
@@ -729,8 +903,7 @@ void PhoneBridge::RunUdp() {
             w16(out + 28, uint16_t(peer_rate));
             w16(out + 30, uint16_t(out_samples * 2));
             for (size_t i = 0; i < out_samples; ++i) {
-                const size_t src_index = peer_rate == 16000 ? i : i * 2;
-                int16_t s = uplink_pending[src_index];
+                const int16_t s = wire_pcm[i];
                 tx_window_sum_sq += int64_t(s) * s;
                 tx_window_peak = std::max<int16_t>(tx_window_peak, std::abs(s));
                 ++tx_window_samples;
@@ -740,9 +913,8 @@ void PhoneBridge::RunUdp() {
             size_t payload_bytes = out_samples * 2;
 #if CONFIG_GATEWAY_MANAGER
             if (gateway_manager_peer_audio_codecs() & 2) {
-                size_t compressed =
-                    ima_adpcm_encode(uplink_pending.data(), out_samples, peer_rate == 16000 ? 1 : 2,
-                                     out + kHeader, sizeof(out) - kHeader, &tx_adpcm_index);
+                size_t compressed = ima_adpcm_encode(wire_pcm, out_samples, 1, out + kHeader,
+                                                     sizeof(out) - kHeader, &tx_adpcm_index);
                 // Bounds/rate/index are owned here; fail the session explicitly
                 // if these invariants ever break rather than sending malformed PCM.
                 if (!compressed) {
@@ -764,6 +936,8 @@ void PhoneBridge::RunUdp() {
             }
             const int sent = sendto(fd, out, kHeader + payload_bytes, 0,
                                     reinterpret_cast<sockaddr*>(&peer), peer_len);
+            if (sent == int(kHeader + payload_bytes))
+                CallRecords::Instance().Capture(true, wire_pcm, out_samples, peer_rate);
 #if CONFIG_GATEWAY_MANAGER
             if (sent == int(kHeader + payload_bytes))
                 gateway_manager_note_media(true);
@@ -786,7 +960,8 @@ void PhoneBridge::RunUdp() {
                              unsigned(heap_caps_get_largest_free_block(external)));
                 }
             }
-            uplink_pending.erase(uplink_pending.begin(), uplink_pending.begin() + kFrame16);
+            if (!ai_route)
+                uplink_pending.erase(uplink_pending.begin(), uplink_pending.begin() + kFrame16);
             tx_seq++;
             if (++tx_packets == 1 || (tx_packets % 250) == 0) {
                 const uint32_t rms =

@@ -1,14 +1,16 @@
 #include "audio_service.h"
 #include <esp_log.h>
 #include <cstring>
+#include "background_work.h"
+#include "pcm_rate_converter.h"
 #if CONFIG_PHONE_BRIDGE
 #include <inttypes.h>
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include "assets/lang_config.h"
 #include "esp_crc.h"
 #include "esp_heap_caps.h"
-#include "assets/lang_config.h"
 #include "mbedtls/base64.h"
 #endif
 #if CONFIG_ALIYUN_REALTIME
@@ -176,14 +178,12 @@ void AudioService::Start() {
         "audio_output", 2048, this, 4, &audio_output_task_handle_);
 #endif
 
-    /* Start the opus codec task */
-    xTaskCreate(
-        [](void* arg) {
-            AudioService* audio_service = (AudioService*)arg;
-            audio_service->OpusCodecTask();
-            vTaskDelete(NULL);
-        },
-        "opus_codec", 2048 * 12, this, 2, &opus_codec_task_handle_);
+    // This task performs PCM/Opus conversion and queue operations only. Hardware
+    // I/O and NVS stay on their internal stacks. Reclaim its 24 KiB internal
+    // budget on supported PSRAM builds without shrinking the measured stack.
+    if (!StartBackgroundWork("opus_codec", 2048 * 12, 2, [this]() { OpusCodecTask(); })) {
+        ESP_LOGE(TAG, "Audio codec worker unavailable");
+    }
 }
 
 void AudioService::Stop() {
@@ -221,18 +221,18 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
         if (!codec_->InputData(data)) {
             return false;
         }
-        if (input_resampler_ != nullptr) {
-            std::lock_guard<std::mutex> lock(input_resampler_mutex_);
-            uint32_t in_sample_num = data.size() / codec_->input_channels();
-            uint32_t output_samples = 0;
-            esp_ae_rate_cvt_get_max_out_sample_num(input_resampler_, in_sample_num,
-                                                   &output_samples);
-            auto resampled = std::vector<int16_t>(output_samples * codec_->input_channels());
-            uint32_t actual_output = output_samples;
-            esp_ae_rate_cvt_process(input_resampler_, (esp_ae_sample_t)data.data(), in_sample_num,
-                                    (esp_ae_sample_t)resampled.data(), &actual_output);
-            resampled.resize(actual_output * codec_->input_channels());
-            data = std::move(resampled);
+        std::lock_guard<std::mutex> lock(input_resampler_mutex_);
+        const size_t frame_samples = data.size() / codec_->input_channels();
+        // Capture modes use 10/20/60 ms frames. The library's streaming phase
+        // state does not safely resize across those frames; start a new stream
+        // at the mode boundary rather than carrying old-call history into it.
+        if (input_resampler_frame_samples_ && input_resampler_frame_samples_ != frame_samples &&
+            !RecreateInputResamplerLocked()) {
+            return false;
+        }
+        input_resampler_frame_samples_ = frame_samples;
+        if (!ConvertPcmRate(input_resampler_, data, codec_->input_channels(), data)) {
+            return false;
         }
     } else {
         data.resize(samples * codec_->input_channels());
@@ -525,6 +525,66 @@ void AudioService::CapturePhonePcm(const int16_t* pcm, size_t samples, uint32_t 
 }
 
 bool AudioService::HandlePhoneDebugCommand(const char* line) {
+#if CONFIG_HEAP_POISONING_LIGHT
+    if (std::strcmp(line, "phone resampler check") == 0) {
+        // An independent instance and synthetic PCM: no microphone, Bluetooth,
+        // cloud connection or mutation of the live resampler's state.
+        bool ok = true;
+        const unsigned rates[][2] = {{24000, 16000}, {16000, 24000}, {24000, 8000}, {8000, 24000}};
+        for (const auto& rate : rates) {
+            if (!ok)
+                break;
+            for (unsigned channels : {1U, 2U}) {
+                auto cfg = RATE_CVT_CFG(rate[0], rate[1], channels);
+                esp_ae_rate_cvt_handle_t handle = nullptr;
+                auto result = esp_ae_rate_cvt_open(&cfg, &handle);
+                if (result != ESP_AE_ERR_OK || !handle) {
+                    printf("RESAMPLER_CHECK FAIL open=%d\n", int(result));
+                    ok = false;
+                    break;
+                }
+                unsigned previous_count = 0;
+                for (unsigned iteration = 0; iteration < 512 && ok; ++iteration) {
+                    const unsigned count =
+                        cfg.src_rate / (iteration >= 256 && iteration % 4 == 0 ? 50 : 100);
+                    std::vector<int16_t> input(count * cfg.channel), output;
+                    for (size_t i = 0; i < input.size(); ++i)
+                        input[i] = int16_t((i * 317 + iteration * 73) % 20000 - 10000);
+                    if (previous_count && previous_count != count) {
+                        esp_ae_rate_cvt_close(handle);
+                        handle = nullptr;
+                        if (esp_ae_rate_cvt_open(&cfg, &handle) != ESP_AE_ERR_OK || !handle) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    previous_count = count;
+                    if (!ConvertPcmRate(handle, input, channels, output)) {
+                        printf("RESAMPLER_CHECK FAIL iteration=%u input=%u\n", iteration, count);
+                        ok = false;
+                    }
+                    if (iteration >= 256 && iteration % 13 == 0) {
+                        esp_ae_rate_cvt_close(handle);
+                        handle = nullptr;
+                        if (esp_ae_rate_cvt_open(&cfg, &handle) != ESP_AE_ERR_OK || !handle)
+                            ok = false;
+                        previous_count = 0;
+                    }
+                    vTaskDelay(1);
+                }
+                if (handle)
+                    esp_ae_rate_cvt_close(handle);
+                printf("RESAMPLER_CHECK case src=%u dst=%u channels=%u result=%s\n", rate[0],
+                       rate[1], channels, ok ? "PASS" : "FAIL");
+                if (!ok)
+                    break;
+            }
+        }
+        if (ok)
+            puts("RESAMPLER_CHECK PASS cases=8 iterations=4096 scope=synthetic_library_bounds");
+        return true;
+    }
+#endif
     if (std::strcmp(line, "phone prompt") == 0) {
         if (!pcm_transport_.load() || !IsPlaybackIdle()) {
             puts("PHONE_PROMPT_ERROR requires_idle_phone_playback");
@@ -683,16 +743,7 @@ void AudioService::OpusCodecTask() {
                 SetDecodeSampleRate(packet->sample_rate, 20);
                 if (packet->sample_rate != codec_->output_sample_rate() &&
                     output_resampler_ != nullptr) {
-                    uint32_t target_size = 0;
-                    esp_ae_rate_cvt_get_max_out_sample_num(output_resampler_, task.pcm.size(),
-                                                           &target_size);
-                    std::vector<int16_t> resampled(target_size);
-                    uint32_t actual_output = target_size;
-                    esp_ae_rate_cvt_process(output_resampler_, (esp_ae_sample_t)task.pcm.data(),
-                                            task.pcm.size(), (esp_ae_sample_t)resampled.data(),
-                                            &actual_output);
-                    resampled.resize(actual_output);
-                    task.pcm = std::move(resampled);
+                    ConvertPcmRate(output_resampler_, task.pcm, 1, task.pcm);
                 }
                 decoded = !task.pcm.empty();
             } else if (!packet->pcm) {
@@ -718,18 +769,9 @@ void AudioService::OpusCodecTask() {
                         task.pcm.resize(out_frame.decoded_size / sizeof(int16_t));
                         if (decoder_sample_rate_ != codec_->output_sample_rate() &&
                             output_resampler_ != nullptr) {
-                            uint32_t target_size = 0;
-                            esp_ae_rate_cvt_get_max_out_sample_num(output_resampler_,
-                                                                   task.pcm.size(), &target_size);
-                            std::vector<int16_t> resampled(target_size);
-                            uint32_t actual_output = target_size;
-                            esp_ae_rate_cvt_process(
-                                output_resampler_, (esp_ae_sample_t)task.pcm.data(),
-                                task.pcm.size(), (esp_ae_sample_t)resampled.data(), &actual_output);
-                            resampled.resize(actual_output);
-                            task.pcm = std::move(resampled);
+                            ConvertPcmRate(output_resampler_, task.pcm, 1, task.pcm);
                         }
-                        decoded = true;
+                        decoded = !task.pcm.empty();
                     } else {
                         ESP_LOGE(TAG, "Failed to decode audio after resize, error code: %d", ret);
                     }
@@ -1015,6 +1057,37 @@ std::unique_ptr<AudioStreamPacket> AudioService::PopWakeWordPacket() {
     return nullptr;
 }
 
+bool AudioService::RecreateInputResampler() {
+    std::lock_guard<std::mutex> lock(input_resampler_mutex_);
+    return RecreateInputResamplerLocked();
+}
+
+bool AudioService::RecreateInputResamplerLocked() {
+    input_resampler_frame_samples_ = 0;
+    if (codec_->input_sample_rate() == 16000)
+        return true;
+    // Recreate at frame-size/mode boundaries under the processing lock so no
+    // old-call tail or invalid phase bound enters resumed normal audio.
+    if (input_resampler_)
+        esp_ae_rate_cvt_close(input_resampler_);
+    input_resampler_ = nullptr;
+    auto cfg = RATE_CVT_CFG(codec_->input_sample_rate(), 16000, codec_->input_channels());
+    const auto result = esp_ae_rate_cvt_open(&cfg, &input_resampler_);
+    if (result == ESP_AE_ERR_OK && input_resampler_)
+        return true;
+    constexpr uint32_t internal = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    constexpr uint32_t external = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+    ESP_LOGE(TAG,
+             "Input resampler recreate failed result=%d internal_free=%u min=%u largest=%u "
+             "psram_free=%u largest=%u",
+             int(result), unsigned(heap_caps_get_free_size(internal)),
+             unsigned(heap_caps_get_minimum_free_size(internal)),
+             unsigned(heap_caps_get_largest_free_block(internal)),
+             unsigned(heap_caps_get_free_size(external)),
+             unsigned(heap_caps_get_largest_free_block(external)));
+    return false;
+}
+
 void AudioService::EnableWakeWordDetection(bool enable) {
     ESP_LOGD(TAG, "%s wake word detection", enable ? "Enabling" : "Disabling");
     if (enable) {
@@ -1033,11 +1106,9 @@ void AudioService::EnableWakeWordDetection(bool enable) {
             xEventGroupClearBits(event_group_, AS_EVENT_WAKE_WORD_RUNNING);
             return;
         }
-        {
-            std::lock_guard<std::mutex> lock(input_resampler_mutex_);
-            if (input_resampler_ != nullptr) {
-                esp_ae_rate_cvt_reset(input_resampler_);
-            }
+        if (!RecreateInputResampler()) {
+            xEventGroupClearBits(event_group_, AS_EVENT_WAKE_WORD_RUNNING);
+            return;
         }
         audio_engine_->EnableWakeWordDetection(true);
         xEventGroupSetBits(event_group_, AS_EVENT_WAKE_WORD_RUNNING);
@@ -1072,11 +1143,9 @@ void AudioService::EnableVoiceProcessing(bool enable) {
         }
         ResetDecoder();
         audio_input_need_warmup_ = true;
-        {
-            std::lock_guard<std::mutex> lock(input_resampler_mutex_);
-            if (input_resampler_ != nullptr) {
-                esp_ae_rate_cvt_reset(input_resampler_);
-            }
+        if (!RecreateInputResampler()) {
+            xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_PROCESSOR_RUNNING);
+            return;
         }
         audio_engine_->EnableVoiceProcessing(true);
         xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_PROCESSOR_RUNNING);

@@ -2,6 +2,7 @@
 #define DISPLAY_H
 
 #include "emoji_collection.h"
+#include "phone_ai_state.h"
 #include "text_glyph.h"
 
 #ifndef CONFIG_USE_EMOTE_MESSAGE_STYLE
@@ -49,6 +50,8 @@ public:
     // physical refresh has already completed. Callers are free to ignore the result.
     virtual bool SetEmotion(const char* emotion);
     virtual void SetChatMessage(const char* role, const char* content);
+    virtual void SetPhoneAiState(PhoneAiState state) {}
+    virtual void AddPhoneTranscript(bool user, const char* text) {}
     // Remove a matching message without clearing newer content, when supported.
     virtual void RemoveChatMessage(const char* role, const char* content) {}
     virtual void ClearChatMessages();
@@ -60,6 +63,8 @@ public:
     virtual void ClearTextGlyphs() {}
     virtual void SetEmojiCollection(std::shared_ptr<EmojiCollection>) {}
     virtual void SetupUI() { setup_ui_called_ = true; }
+    // Optional board UI automation; unsupported displays keep a no-op fallback.
+    virtual bool HandleUiDebugCommand(const char* command) { return false; }
     virtual bool IsMonochrome() const { return false; }
     virtual bool SupportsGuiOperations() const { return false; }
     virtual void SetHideSubtitle(bool hide) { (void)hide; }

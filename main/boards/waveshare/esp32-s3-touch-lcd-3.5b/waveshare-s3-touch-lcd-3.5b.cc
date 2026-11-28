@@ -12,6 +12,11 @@
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_vendor.h>
 #include <esp_log.h>
+#if CONFIG_PHONE_RECORDS
+#include <driver/sdmmc_host.h>
+#include <esp_vfs_fat.h>
+#include <sdmmc_cmd.h>
+#endif
 #include "i2c_device.h"
 
 #include <esp_timer.h>
@@ -169,6 +174,9 @@ private:
     LcdDisplay* display_;
     PowerSaveTimer* power_save_timer_;
     EspVideo* camera_;
+#if CONFIG_PHONE_RECORDS
+    sdmmc_card_t* call_sd_card_ = nullptr;
+#endif
 
     void InitializePowerSaveTimer() {
         power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
@@ -236,6 +244,9 @@ private:
         buscfg.data3_io_num = DISPLAY_DATA3_PIN;
         buscfg.sclk_io_num = DISPLAY_CLK_PIN;
         buscfg.max_transfer_sz = DISPLAY_TRANS_SIZE * sizeof(uint16_t);
+        // Match the LCD/LVGL task's affinity: avoid cross-core polling/ISR
+        // handoff in this SDK's SPI bus lock. SD storage uses SDMMC separately.
+        buscfg.isr_cpu_id = ESP_INTR_CPU_AFFINITY_0;
         ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO));
     }
 
@@ -406,6 +417,55 @@ public:
         return &backlight;
     }
     virtual Camera* GetCamera() override { return camera_; }
+
+    bool MountCallStorage(const char** path, std::string& error) override {
+#if CONFIG_PHONE_RECORDS
+        *path = "/sdcard";
+        error.clear();
+        if (call_sd_card_)
+            return true;
+        // Schematic J4: CMD=IO10, CLK=IO11, D0=IO9, D3=EXIO3.
+        // Native 1-bit SD leaves D3 high; no GPIO or expander SPI-CS emulation.
+        esp_err_t result =
+            esp_io_expander_set_dir(io_expander, IO_EXPANDER_PIN_NUM_3, IO_EXPANDER_OUTPUT);
+        if (result == ESP_OK)
+            result = esp_io_expander_set_level(io_expander, IO_EXPANDER_PIN_NUM_3, 1);
+        sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+        host.max_freq_khz = 10000;
+        host.command_timeout_ms = 1000;
+        sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
+        slot.width = 1;
+        slot.clk = GPIO_NUM_11;
+        slot.cmd = GPIO_NUM_10;
+        slot.d0 = GPIO_NUM_9;
+        slot.d1 = slot.d2 = slot.d3 = GPIO_NUM_NC;
+        slot.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
+        esp_vfs_fat_sdmmc_mount_config_t mount{};
+        mount.format_if_mount_failed = false;
+        mount.max_files = 8;
+        mount.allocation_unit_size = 16 * 1024;
+        if (result == ESP_OK)
+            result = esp_vfs_fat_sdmmc_mount(*path, &host, &slot, &mount, &call_sd_card_);
+        if (result != ESP_OK) {
+            error = std::string("sd_mount_") + esp_err_to_name(result);
+            ESP_LOGE(TAG, "SD mount failed: %s (card will not be formatted)",
+                     esp_err_to_name(result));
+            return false;
+        }
+        sdmmc_card_print_info(stdout, call_sd_card_);
+        return true;
+#else
+        return Board::MountCallStorage(path, error);
+#endif
+    }
+    void UnmountCallStorage() override {
+#if CONFIG_PHONE_RECORDS
+        if (call_sd_card_) {
+            esp_vfs_fat_sdcard_unmount("/sdcard", call_sd_card_);
+            call_sd_card_ = nullptr;
+        }
+#endif
+    }
 
 #if PMIC_ENABLE
     virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {

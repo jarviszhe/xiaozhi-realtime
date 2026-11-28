@@ -37,6 +37,8 @@ set(SOURCES "audio/audio_codec.cc"
             "system_info.cc"
             "application.cc"
             "phone_bridge.cc"
+            "call_records.cc"
+            "call_record_cloud.cc"
             "ota.cc"
             "settings.cc"
             "device_state_machine.cc"
@@ -1204,6 +1206,9 @@ if(CONFIG_GATEWAY_MANAGER)
     list(APPEND SOURCES "gateway_manager.c" "gateway_serial.cc")
     list(APPEND MAIN_PRIV_REQUIRES_EXTRA mdns esp_driver_usb_serial_jtag)
 endif()
+if(CONFIG_PHONE_RECORDS)
+    list(APPEND MAIN_PRIV_REQUIRES_EXTRA esp_driver_sdmmc sdmmc)
+endif()
 
 idf_component_register(SRCS ${SOURCES}
                     EMBED_FILES ${LANG_SOUNDS} ${COMMON_SOUNDS}
@@ -1313,6 +1318,22 @@ endif()
 find_component_by_pattern("xiaozhi-fonts" NOTO_FONTS_COMPONENT NOTO_FONTS_COMPONENT_PATH)
 if(NOTO_FONTS_COMPONENT_PATH)
     set(NOTO_FONTS_PATH "${NOTO_FONTS_COMPONENT_PATH}")
+endif()
+
+# Settings/provisioning must remain readable before network activation or asset
+# loading. Compile only the board's UI glyphs from the pinned common font.
+if(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5B AND CONFIG_GATEWAY_MANAGER
+   AND NOT CMAKE_BUILD_EARLY_EXPANSION)
+    set(PHONE_UI_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_DIR}/phone_settings_view.cc")
+    set(PHONE_UI_FONT "${CMAKE_CURRENT_BINARY_DIR}/phone_settings_font.cc")
+    add_custom_command(OUTPUT "${PHONE_UI_FONT}"
+        COMMAND ${PYTHON} "${PROJECT_DIR}/scripts/generate_phone_ui_font.py"
+            --fonts "${NOTO_FONTS_PATH}" --source "${PHONE_UI_SOURCE}" --output "${PHONE_UI_FONT}"
+        DEPENDS "${PHONE_UI_SOURCE}" "${PROJECT_DIR}/scripts/generate_phone_ui_font.py"
+            "${NOTO_FONTS_PATH}/scripts/glyph_provider.py"
+            "${NOTO_FONTS_PATH}/cbin/font_noto_sans_common_16_4.bin"
+        VERBATIM)
+    target_sources(${COMPONENT_LIB} PRIVATE "${PHONE_UI_FONT}")
 endif()
 
 if(CONFIG_BOARD_TYPE_ESP_VOCAT OR CONFIG_BOARD_TYPE_CYBERAI_VOCAT_V2_0 OR CONFIG_BOARD_TYPE_CYBERAI_VOCAT_V2_1)

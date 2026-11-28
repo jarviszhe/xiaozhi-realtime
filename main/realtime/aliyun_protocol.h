@@ -37,6 +37,9 @@ public:
     void OnResponseDone(std::function<void(uint64_t)> callback) {
         on_response_done_ = std::move(callback);
     }
+    void OnSpeechStopped(std::function<void()> callback) {
+        on_speech_stopped_ = std::move(callback);
+    }
     bool IsCurrentResponse(uint64_t token) const;
     uint32_t connection_generation() const { return connection_generation_.load(); }
     void OnTranscript(std::function<void(bool user, const std::string&)> callback) {
@@ -63,6 +66,7 @@ private:
     std::string cancel_event_id_;
     std::function<void(uint64_t)> on_response_started_;
     std::function<void(uint64_t)> on_response_done_;
+    std::function<void()> on_speech_stopped_;
     std::function<void(bool, const std::string&)> on_transcript_;
 };
 

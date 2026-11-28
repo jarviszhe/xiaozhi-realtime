@@ -1,5 +1,6 @@
 #include "config_web.h"
 
+#include <esp_heap_caps.h>
 #include <esp_http_server.h>
 #include <esp_log.h>
 #include <esp_system.h>
@@ -9,6 +10,10 @@
 #include <cstring>
 #include <string>
 #include "application.h"
+#include "call_records.h"
+#if CONFIG_PHONE_RECORDS
+#include "call_record_memory.h"
+#endif
 #include "config.h"
 #include "settings.h"
 #if CONFIG_SOC_WIFI_SUPPORTED
@@ -165,6 +170,47 @@ esp_err_t Options(httpd_req_t* request) {
     return Reply(request, "200 OK", "{}");
 }
 
+#if CONFIG_PHONE_RECORDS
+esp_err_t RecordFile(httpd_req_t* request) {
+    // Existing explicit debug mode gates private recordings; no listing or
+    // download is exposed by default in normal product mode.
+    if (!LoadAliyunRealtimeConfig().debug_enabled)
+        return Reply(request, "403 Forbidden", "{\"error\":\"debug_disabled\"}");
+    char query[192], id[20], name[32], offset_text[24]{};
+    if (httpd_req_get_url_query_str(request, query, sizeof(query)) != ESP_OK ||
+        httpd_query_key_value(query, "id", id, sizeof(id)) != ESP_OK ||
+        httpd_query_key_value(query, "file", name, sizeof(name)) != ESP_OK)
+        return Reply(request, "400 Bad Request", "{\"error\":\"invalid_file\"}");
+    uint64_t offset = 0;
+    if (httpd_query_key_value(query, "offset", offset_text, sizeof(offset_text)) == ESP_OK) {
+        char* end = nullptr;
+        offset = strtoull(offset_text, &end, 10);
+        if (!offset_text[0] || *end || offset_text[0] == '-')
+            return Reply(request, "400 Bad Request", "{\"error\":\"invalid_offset\"}");
+    }
+    char* buffer = static_cast<char*>(heap_caps_malloc(8192, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!buffer) {
+        call_record::AllocationFailure("record_http", 8192, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        return Reply(request, "503 Service Unavailable", "{\"error\":\"memory\"}");
+    }
+    size_t bytes = 0;
+    uint64_t total = 0;
+    const bool ok = CallRecords::Instance().ReadFile(id, name, offset, buffer, 8192, bytes, total);
+    if (!ok) {
+        heap_caps_free(buffer);
+        return Reply(request, "404 Not Found", "{\"error\":\"unavailable_or_not_finalized\"}");
+    }
+    char length[32];
+    snprintf(length, sizeof(length), "%llu", total);
+    httpd_resp_set_hdr(request, "X-File-Size", length);
+    httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+    httpd_resp_set_type(request, "application/octet-stream");
+    const auto result = httpd_resp_send(request, buffer, bytes);
+    heap_caps_free(buffer);
+    return result;
+}
+#endif
+
 esp_err_t Provision(httpd_req_t* request) {
     if (!wifi_action)
         return Reply(request, "400 Bad Request", "{}");
@@ -246,6 +292,9 @@ void StartAliyunConfigWeb(bool provisioning) {
         {.uri = "/api/volume", .method = HTTP_POST, .handler = Volume},
         {.uri = "/api/restart", .method = HTTP_POST, .handler = Restart},
         {.uri = "/api/test/chat", .method = HTTP_POST, .handler = ChatAction},
+#if CONFIG_PHONE_RECORDS
+        {.uri = "/api/test/record-file", .method = HTTP_GET, .handler = RecordFile},
+#endif
     };
     for (const auto& route : routes)
         httpd_register_uri_handler(server, &route);

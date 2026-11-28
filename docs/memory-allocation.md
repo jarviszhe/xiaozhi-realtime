@@ -40,6 +40,8 @@ PSRAM 分配失败时，非必要的大块功能应明确失败、降级或减�
 
 ## 本项目已有案例
 
+2026-11-27，设置页实机测试发现本板 LCD 的 SPI 命令会使用调用者栈上的参数。把 LVGL 栈外置后，SPI 驱动为这些参数申请内部 DMA 临时缓冲，在正常模型／音频启动期间分配失败；旧刷新回调又无期限等待未发出的 DMA 完成信号，导致显示锁无法释放。因此此板驱动调用栈保留内部 10240 字节，串口 UI 任务栈 12288 字节和 RGB565 截图 307200 字节显式使用 PSRAM，字库存放固件只读区。刷新提交检查错误、完成等待有上限。组件允许外部栈不代表下游硬件驱动无额外约束，迁移必须测试正常启动和页面绘制；不能只看任务创建成功。
+
 2026-11-25，S3 总空闲约 5 MB，但 mDNS 申请 4096 字节内部任务栈失败；重试又导致重复注册刷屏。Waveshare ESP32-S3 Touch LCD 3.5B 使用组件支持的 `CONFIG_MDNS_TASK_CREATE_FROM_SPIRAM=y` 和 `CONFIG_MDNS_MEMORY_ALLOC_SPIRAM=y` 后，通过重复软件复位与保留绑定恢复配网回归。它说明应按内存能力和连续块诊断，不代表可以把所有任务栈外置，也不代表整体内存余量已充分。
 
 证据及限制见 [designv1 第 17.10 节](../designv1/esp32-hfp-s3-realtime-design.md#1710-2026-11-25-mdns-启动内存不足与重复初始化)。通用规则以实际使用的 ESP-IDF 版本为准；当前 SDK 对照位置为 `docs/en/api-guides/external-ram.rst`、`components/heap/include/esp_heap_caps.h`、`components/freertos/esp_additions/include/freertos/idf_additions.h`。

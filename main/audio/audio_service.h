@@ -183,6 +183,9 @@ private:
     std::mutex decoder_mutex_;
     std::mutex input_resampler_mutex_;
     esp_ae_rate_cvt_handle_t input_resampler_ = nullptr;
+    bool RecreateInputResampler();
+    bool RecreateInputResamplerLocked();
+    size_t input_resampler_frame_samples_ = 0;
     esp_ae_rate_cvt_handle_t output_resampler_ = nullptr;
 
     // Encoder/Decoder state

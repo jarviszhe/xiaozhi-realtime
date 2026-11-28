@@ -26,6 +26,7 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "gateway_tcp_diagnostics.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
 #include "mbedtls/platform_util.h"
@@ -55,6 +56,13 @@ enum {
     P_ERROR = 7
 };
 enum { C_HELLO = 1, C_CHALLENGE, C_AUTH, C_READY, C_PING, C_PONG };
+#define CONTROL_PHONE_CMD 2
+#define CONTROL_PHONE_ACK 5
+#define CONTROL_PHONE_ACK_RESULT 8
+#define CONTROL_PHONE_STATUS_SETUP 9
+#define CONTROL_PHONE_STATUS_ACTIVE 10
+#define CONTROL_PHONE_CALL_ID 11
+#define CONTROL_PHONE_CAPS 15
 typedef struct __attribute__((packed)) {
     char magic[4];
     uint8_t op, flags;
@@ -111,6 +119,7 @@ static const char* TAG = "gateway_manager";
 static bool s_host;
 static atomic_bool s_bound, s_ready, s_encrypted, s_connected, s_adv, s_scanning;
 static atomic_bool s_request, s_candidate;
+static atomic_bool s_ble_opening;
 static bool s_config_sent, s_reprovision, s_recovery_scan;
 static uint8_t s_id[6], s_remote[6];
 static char s_name[20], s_peer_id[16], s_stage[32] = "starting", s_error[48];
@@ -140,10 +149,31 @@ static atomic_uint s_mdns_failures;
 static led_strip_handle_t s_led;
 #endif
 static char s_led_name[24] = "off";
+// Protected by s_mutex; a request and its identity are one atomic snapshot.
+static phone_request_t s_phone_request;
+static phone_status_t s_phone_status;
+static bool s_phone_available;
+static int64_t s_phone_seen_at;
+static uint32_t s_phone_duration_ms;
+static gateway_ui_status_t s_ui_status;
+static uint32_t s_scan_serial, s_scan_done_serial;
+static int64_t s_confirm_deadline;
 
 _Static_assert(sizeof(provision_packet_t) == 198, "provision wire size");
 _Static_assert(sizeof(control_packet_t) == 128, "control wire size");
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
+static uint16_t get_u16(const uint8_t* p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
+static void put_u16(uint8_t* p, uint16_t value) {
+    p[0] = (uint8_t)value;
+    p[1] = (uint8_t)(value >> 8);
+}
+static uint32_t get_u32(const uint8_t* p) {
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+static void put_u32(uint8_t* p, uint32_t value) {
+    for (unsigned i = 0; i < 4; ++i)
+        p[i] = (uint8_t)(value >> (8 * i));
+}
 static bool zero(const void* p, size_t n) {
     const uint8_t* b = p;
     uint8_t v = 0;
@@ -271,8 +301,58 @@ static bool wifi_online(void) {
     wifi_ap_record_t ap;
     esp_netif_ip_info_t info;
     esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-    return netif && esp_wifi_sta_get_ap_info(&ap) == ESP_OK &&
-           esp_netif_get_ip_info(netif, &info) == ESP_OK && info.ip.addr;
+    // Querying AP info while disconnected emits a driver warning. The worker
+    // checks this at 50 Hz; use netif state first to avoid offline log flooding.
+    return netif && esp_netif_is_netif_up(netif) && esp_netif_get_ip_info(netif, &info) == ESP_OK &&
+           info.ip.addr && esp_wifi_sta_get_ap_info(&ap) == ESP_OK;
+}
+bool gateway_manager_get_ui_status(gateway_ui_status_t* out) {
+    if (!out)
+        return false;
+    memset(out, 0, sizeof(*out));
+    if (!s_mutex)
+        return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    *out = s_ui_status;
+    out->bound = s_bound;
+    if (out->bound)
+        id_text(s_binding.peer, out->peer_id);
+    int64_t age = now_ms() - atomic_load(&s_last_link);
+    out->ready = s_ready;
+    out->remote_fresh = s_ready && s_have_remote && age >= 0 && age < 2000 &&
+                        !memcmp(s_remote_status.node, s_binding.peer, sizeof(s_binding.peer));
+    out->hfp = out->remote_fresh ? s_remote_status.hfp : 0;
+    out->sco = out->remote_fresh ? s_remote_status.sco : 0;
+    xSemaphoreGive(s_mutex);
+    return out->available;
+}
+// Only the manager worker reads its mutable discovery/provisioning data.
+static void publish_ui_status(void) {
+    gateway_ui_status_t out = {.available = true,
+                               .wifi = wifi_online(),
+                               .bound = s_bound,
+                               .scanning = s_scanning,
+                               .provisioning = s_request,
+                               .ble = s_connected,
+                               .config_sent = s_config_sent,
+                               .scan_serial = s_scan_serial,
+                               .scan_done_serial = s_scan_done_serial,
+                               .count = s_found_count};
+    strlcpy(out.peer_id, s_peer_id, sizeof(out.peer_id));
+    if (s_request)
+        id_text(s_pending.target, out.target_id);
+    strlcpy(out.stage, s_stage, sizeof(out.stage));
+    strlcpy(out.error, s_error, sizeof(out.error));
+    int64_t remaining =
+        (!strcmp(s_stage, "waiting_button") ? s_confirm_deadline : s_deadline) - now_ms();
+    out.remaining_ms = s_request && remaining > 0 ? (uint32_t)remaining : 0;
+    for (unsigned i = 0; i < out.count; ++i) {
+        strlcpy(out.peers[i].id, s_found[i].id, sizeof(out.peers[i].id));
+        out.peers[i].rssi = s_found[i].rssi;
+    }
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_ui_status = out;
+    xSemaphoreGive(s_mutex);
 }
 static void peer(uint32_t ip, bool ready) {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
@@ -282,6 +362,15 @@ static void peer(uint32_t ip, bool ready) {
     }
     s_peer_ip = ready ? ip : 0;
     s_ready = ready;
+    if (!ready) {
+        s_phone_available = false;
+        memset(&s_phone_status, 0, sizeof(s_phone_status));
+        if (s_phone_request.command) {
+            ESP_LOGW(TAG, "PHONE_COMMAND_END command=%u request=%u result=disconnected",
+                     s_phone_request.command, s_phone_request.sequence);
+            phone_request_finish(&s_phone_request, PHONE_DISCONNECTED);
+        }
+    }
     xSemaphoreGive(s_mutex);
     if (s_hooks.peer)
         s_hooks.peer(ip, ready);
@@ -319,6 +408,7 @@ static void status(void) {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     remote = s_remote_status;
     have_remote = s_have_remote;
+    phone_request_t request = s_phone_request;
     xSemaphoreGive(s_mutex);
     struct in_addr ip = {.s_addr = s_peer_ip};
     inet_ntoa_r(ip, address, sizeof(address));
@@ -332,6 +422,8 @@ static void status(void) {
         ",\"remote_fresh\":%s,\"remote_hfp\":%u"
         ",\"remote_sco\":%u,\"remote_rate\":%u,\"remote_rx\":%" PRIu32 ",\"remote_tx\":%" PRIu32
         ",\"media_rx\":%" PRIu32 ",\"media_tx\":%" PRIu32
+        ",\"remote_call_setup\":%u,\"remote_call_active\":%u"
+        ",\"phone_command\":%u,\"phone_command_seq\":%u,\"phone_command_result\":%u"
         ",\"mdns\":%s,\"mdns_failures\":%u,\"internal_free\":%u,\"internal_largest\":%u"
         ",\"psram_free\":%u}\n",
         id, s_host ? "s3" : "gateway", s_bound ? "true" : "false", other,
@@ -340,8 +432,9 @@ static void status(void) {
         now_ms() < s_window ? "true" : "false", s_led_name, s_error, now_ms(), age,
         have_remote && age >= 0 && age < 7000 ? "true" : "false", remote.hfp, remote.sco,
         remote.rate, remote.rx, remote.tx, (uint32_t)atomic_load(&s_media_rx),
-        (uint32_t)atomic_load(&s_media_tx), s_mdns ? "true" : "false",
-        (unsigned)atomic_load(&s_mdns_failures),
+        (uint32_t)atomic_load(&s_media_tx), remote.reserved[CONTROL_PHONE_STATUS_SETUP],
+        remote.reserved[CONTROL_PHONE_STATUS_ACTIVE], request.command, request.sequence,
+        request.result, s_mdns ? "true" : "false", (unsigned)atomic_load(&s_mdns_failures),
         (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
         (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
@@ -359,6 +452,63 @@ bool gateway_manager_command(const char* line) {
     if (!enqueue(&event))
         puts("GATEWAY_ERROR busy");
     return true;
+}
+
+bool gateway_manager_get_phone_status(phone_status_t* phone, int64_t* age_ms,
+                                      uint32_t* duration_ms) {
+    if (!s_mutex || !phone)
+        return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int64_t age = now_ms() - s_phone_seen_at;
+    bool fresh = s_ready && s_phone_available && age >= 0 && age < 2000;
+    *phone = fresh ? s_phone_status : (phone_status_t){0};
+    if (fresh && phone->remaining_ms) {
+        phone->remaining_ms = age < phone->remaining_ms ? phone->remaining_ms - age : 0;
+        if (!phone->remaining_ms)
+            phone->flags &= ~PHONE_AUTO_PENDING;
+    }
+    if (age_ms)
+        *age_ms = fresh ? age : -1;
+    if (duration_ms)
+        *duration_ms = fresh ? s_phone_duration_ms + (phone->active ? (uint32_t)age : 0) : 0;
+    xSemaphoreGive(s_mutex);
+    return fresh;
+}
+void gateway_manager_print_phone_status(void) {
+    phone_status_t phone;
+    int64_t age;
+    uint32_t duration;
+    bool fresh = gateway_manager_get_phone_status(&phone, &age, &duration);
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    phone_request_t request = s_phone_request;
+    xSemaphoreGive(s_mutex);
+    printf("PHONE {\"fresh\":%s,\"age_ms\":%" PRId64 ",\"call_id\":%" PRIu32
+           ",\"revision\":%" PRIu32
+           ",\"phase\":%u,\"call_setup\":%u,\"call_active\":%u"
+           ",\"caller\":\"%s\",\"caller_truncated\":%s,\"flags\":%u,\"remaining_ms\":%u"
+           ",\"started_ms\":%" PRIu32 ",\"ended_ms\":%" PRIu32 ",\"duration_ms\":%" PRIu32
+           ",\"at_result\":%u"
+           ",\"command\":%u,\"last_command\":%u,\"request\":%u,\"result\":%u}\n",
+           fresh ? "true" : "false", age, phone.call_id, phone.revision, phone.phase, phone.setup,
+           phone.active, phone.caller_length ? phone.caller : "unknown",
+           phone.flags & PHONE_CALLER_TRUNCATED ? "true" : "false", phone.flags, phone.remaining_ms,
+           phone.started_ms, phone.ended_ms, duration, phone.at_result, request.command,
+           request.last_command, request.sequence, request.result);
+}
+bool gateway_manager_phone_command(uint8_t command) {
+    if (!s_mutex || !s_host || !phone_command_valid(command))
+        return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool fresh = s_ready && s_phone_available && now_ms() - s_phone_seen_at < 2000;
+    bool valid_call = !phone_command_scoped(command) ||
+                      (s_phone_status.call_id && (s_phone_status.setup || s_phone_status.active));
+    bool queued = fresh && valid_call &&
+                  phone_request_queue(&s_phone_request, command, s_phone_status.call_id, now_ms());
+    phone_request_t request = s_phone_request;
+    xSemaphoreGive(s_mutex);
+    ESP_LOGI(TAG, "PHONE_COMMAND command=%u request=%u queued=%d fresh=%d call_id=%" PRIu32,
+             command, request.sequence, queued, fresh, request.call_id);
+    return queued;
 }
 static esp_ble_adv_params_t adv_params = {.adv_int_min = 0x100,
                                           .adv_int_max = 0x180,
@@ -491,12 +641,19 @@ static void gattc(esp_gattc_cb_event_t event, esp_gatt_if_t interface,
                                       .scan_duplicate = BLE_SCAN_DUPLICATE_ENABLE};
         esp_ble_gap_set_scan_params(&scan);
     } else if (event == ESP_GATTC_CONNECT_EVT) {
+        s_ble_opening = false;
+        if (!s_request) {
+            esp_ble_gattc_close(interface, p->connect.conn_id);
+            return;
+        }
         s_conn = p->connect.conn_id;
         s_connected = true;
         s_encrypted = false;
         memcpy(s_remote, p->connect.remote_bda, 6);
         esp_ble_gattc_send_mtu_req(interface, s_conn);
     } else if (event == ESP_GATTC_CFG_MTU_EVT && p->cfg_mtu.status == ESP_GATT_OK) {
+        if (!s_request)
+            return;
         s_mtu = p->cfg_mtu.mtu;
         esp_bt_uuid_t uuid = {.len = ESP_UUID_LEN_16, .uuid.uuid16 = GM_SERVICE};
         esp_ble_gattc_search_service(interface, s_conn, &uuid);
@@ -528,9 +685,14 @@ static void gattc(esp_gattc_cb_event_t event, esp_gatt_if_t interface,
         event_t e = {
             .kind = E_DISCONNECT, .conn = p->disconnect.conn_id, .reason = p->disconnect.reason};
         enqueue(&e);
-    } else if (event == ESP_GATTC_OPEN_EVT && p->open.status != ESP_GATT_OK) {
-        event_t e = {.kind = E_DISCONNECT, .reason = p->open.status};
-        enqueue(&e);
+    } else if (event == ESP_GATTC_CANCEL_OPEN_EVT) {
+        s_ble_opening = false;
+    } else if (event == ESP_GATTC_OPEN_EVT) {
+        s_ble_opening = false;
+        if (p->open.status != ESP_GATT_OK && s_request) {
+            event_t e = {.kind = E_DISCONNECT, .reason = p->open.status};
+            enqueue(&e);
+        }
     }
 }
 static void readback(uint8_t state) {
@@ -545,13 +707,18 @@ static void readback(uint8_t state) {
     xSemaphoreGive(s_mutex);
 }
 static void close_ble(void) {
+    s_request = false;
+    if (s_host && s_ble_opening) {
+        esp_ble_gattc_cancel_open_params_t cancel = {.gattc_if = s_if};
+        memcpy(cancel.remote_bda, s_remote, sizeof(cancel.remote_bda));
+        esp_ble_gattc_cancel_open(&cancel);
+    }
     if (s_connected) {
         if (s_host)
             esp_ble_gattc_close(s_if, s_conn);
         else
             esp_ble_gatts_close(s_if, s_conn);
     }
-    s_request = false;
     s_config_sent = false;
     mbedtls_platform_zeroize(&s_pending, sizeof(s_pending));
 }
@@ -641,8 +808,11 @@ static void remote_status(const provision_packet_t* p) {
     if (!s_request || memcmp(p->magic, "GWP1", 4) || memcmp(p->node, s_pending.target, 6) ||
         memcmp(p->target, s_id, 6))
         return;
-    if (p->op == P_CONFIRM)
+    if (p->op == P_CONFIRM) {
+        if (strcmp(s_stage, "waiting_button"))
+            s_confirm_deadline = now_ms() + 59500;
         stage("waiting_button");
+    }
     if (p->op == P_AUTHORIZED && !s_config_sent) {
         provision_packet_t out = s_pending;
         out.op = P_CONFIG;
@@ -677,6 +847,7 @@ static void remote_status(const provision_packet_t* p) {
                 close_ble();
                 return;
             }
+            peer(0, false);
             publish_binding(&binding);
             if (!store_named("pending", &binding))
                 fail("pending_finalize_failed");
@@ -690,6 +861,10 @@ static void remote_status(const provision_packet_t* p) {
     }
 }
 static void begin_provision(found_t* found, bool recovery) {
+    if (s_connected || s_ble_opening) {
+        fail("ble_closing_retry");
+        return;
+    }
     if (!wifi_online()) {
         if (recovery) {
             s_recovery_candidate = *found;
@@ -741,8 +916,11 @@ static void begin_provision(found_t* found, bool recovery) {
         s_scanning = false;
     }
     stage("ble_connecting");
+    memcpy(s_remote, found->address, sizeof(s_remote));
+    s_ble_opening = true;
     esp_err_t err = esp_ble_gattc_open(s_if, found->address, found->type, true);
     if (err != ESP_OK) {
+        s_ble_opening = false;
         fail("ble_connect_failed");
         close_ble();
     }
@@ -751,6 +929,23 @@ static void process_command(event_t* e) {
     const char* cmd = e->command;
     if (!strcmp(cmd, "gateway status")) {
         status();
+        return;
+    }
+    if (s_host && !strcmp(cmd, "gateway cancel")) {
+        // Once credentials have been sent, cancellation cannot undo a remote
+        // commit. Keep tracking its real outcome instead of claiming rollback.
+        if (s_config_sent) {
+            fail("config_already_sent");
+            return;
+        }
+        if (s_scanning)
+            esp_ble_gap_stop_scanning();
+        s_scanning = s_recovery_scan = s_recovery_candidate_valid = false;
+        s_scan_done_serial = s_scan_serial;
+        close_ble();
+        s_error[0] = 0;
+        stage(s_ready ? "ready" : s_bound ? "discovering" : "unconfigured");
+        puts("GATEWAY_EVENT operation_cancelled");
         return;
     }
     if (!strncmp(cmd, "found ", 6) && s_host) {
@@ -824,6 +1019,8 @@ static void process_command(event_t* e) {
             return;
         }
         s_recovery_scan = true;
+        ++s_scan_serial;
+        s_error[0] = 0;
         s_found_count = 0;
         if (esp_ble_gap_start_scanning(8) == ESP_OK) {
             s_scanning = true;
@@ -831,6 +1028,7 @@ static void process_command(event_t* e) {
             stage("recovery_scanning");
         } else {
             s_recovery_scan = false;
+            s_scan_done_serial = s_scan_serial;
             fail("scan_failed");
         }
         return;
@@ -840,14 +1038,18 @@ static void process_command(event_t* e) {
             fail("busy_scan");
             return;
         }
+        ++s_scan_serial;
+        s_error[0] = 0;
         s_found_count = 0;
         esp_err_t err = esp_ble_gap_start_scanning(8);
         if (err == ESP_OK) {
             s_scanning = true;
             s_last_poll = now_ms();
             puts("GATEWAY_EVENT scan_started");
-        } else
+        } else {
+            s_scan_done_serial = s_scan_serial;
             fail("scan_failed");
+        }
     } else if (s_host &&
                (!strncmp(cmd, "gateway provision ", 18) || !strcmp(cmd, "gateway reprovision"))) {
         bool recovery = !strcmp(cmd, "gateway reprovision");
@@ -873,8 +1075,10 @@ static bool transfer(int fd, void* data, size_t size, bool writing) {
     size_t offset = 0;
     int64_t started = now_ms();
     int64_t until = started + 6000;
+    int64_t next_diagnostic = started + 1000;
     int last_error = 0;
     while (offset < size && now_ms() < until) {
+        gateway_tcp_diag_poll();
         int n = writing ? send(fd, (uint8_t*)data + offset, size - offset, 0)
                         : recv(fd, (uint8_t*)data + offset, size - offset, 0);
         if (n > 0)
@@ -889,6 +1093,10 @@ static bool transfer(int fd, void* data, size_t size, bool writing) {
                     (unsigned)size, last_error, now_ms() - started);
                 return false;
             }
+            if (now_ms() >= next_diagnostic) {
+                gateway_tcp_diag_request(fd, writing, now_ms() - started);
+                next_diagnostic = now_ms() + 1000;
+            }
             // Accepted socket flags can differ across lwIP versions. Keep a
             // nonblocking EAGAIN path from busy-spinning for the whole deadline.
             vTaskDelay(1);
@@ -899,6 +1107,9 @@ static bool transfer(int fd, void* data, size_t size, bool writing) {
                  "control transfer op=%s result=timeout bytes=%u/%u errno=%d elapsed_ms=%" PRId64,
                  writing ? "send" : "recv", (unsigned)offset, (unsigned)size, last_error,
                  now_ms() - started);
+    else if (now_ms() - started > 1000)
+        ESP_LOGW(TAG, "control slow op=%s bytes=%u elapsed_ms=%" PRId64, writing ? "send" : "recv",
+                 (unsigned)size, now_ms() - started);
     return offset == size;
 }
 static void packet_init(control_packet_t* p, int type, const binding_t* binding) {
@@ -908,8 +1119,17 @@ static void packet_init(control_packet_t* p, int type, const binding_t* binding)
     p->version = 1;
     p->port = GM_MEDIA_PORT;
     p->rate = 16000;
-    p->reserved[0] = 3;               // PCM16 mono, 8 kHz and 16 kHz capabilities.
+    p->reserved[0] = 3;  // PCM16 mono, 8 kHz and 16 kHz capabilities.
     p->reserved[1] = 3;  // Both roles accept PCM and independent IMA ADPCM media.
+    p->reserved[CONTROL_PHONE_CAPS] = PHONE_CONTROL_VERSION;
+    if (s_host) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        phone_request_t request = s_phone_request;
+        xSemaphoreGive(s_mutex);
+        p->reserved[CONTROL_PHONE_CMD] = request.command;
+        put_u16(&p->reserved[CONTROL_PHONE_CMD + 1], request.sequence);
+        put_u32(&p->reserved[CONTROL_PHONE_CALL_ID], request.call_id);
+    }
     memcpy(p->node, s_id, 6);
     memcpy(p->target, binding->peer, 6);
     if (s_hooks.media) {
@@ -928,8 +1148,10 @@ static void packet_init(control_packet_t* p, int type, const binding_t* binding)
     }
 }
 static bool control_send(int fd, control_packet_t* p, const binding_t* binding) {
-    if (!hmac(binding->key, p, offsetof(control_packet_t, proof), p->proof))
+    if (!hmac(binding->key, p, offsetof(control_packet_t, proof), p->proof)) {
+        ESP_LOGE(TAG, "control signing failed type=%u sequence=%" PRIu32, p->type, p->sequence);
         return false;
+    }
     return transfer(fd, p, sizeof(*p), true);
 }
 static bool control_receive(int fd, control_packet_t* p, int type, bool authenticated,
@@ -951,9 +1173,16 @@ static bool control_receive(int fd, control_packet_t* p, int type, bool authenti
     return valid;
 }
 static bool session(int fd, uint32_t ip, const binding_t* binding) {
+    ++s_tcp_diag_session;
     bool authenticated_ready = false;
     uint32_t heartbeat = 0;
     struct timeval timeout = {.tv_usec = 250000};
+    // Each heartbeat consists of small request/status messages. Send them
+    // promptly rather than holding the next status behind an unacknowledged
+    // segment while Wi-Fi shares airtime with HFP on the peer.
+    const int no_delay = 1;
+    if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(no_delay)))
+        ESP_LOGW(TAG, "control TCP_NODELAY failed errno=%d", errno);
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
     control_packet_t out, in;
@@ -1015,6 +1244,47 @@ static bool session(int fd, uint32_t ip, const binding_t* binding) {
                      seq, in.sequence);
             break;
         }
+        if (s_host) {
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            bool ack = phone_request_ack(&s_phone_request, in.reserved[CONTROL_PHONE_ACK],
+                                         get_u16(&in.reserved[CONTROL_PHONE_ACK + 1]),
+                                         in.reserved[CONTROL_PHONE_ACK_RESULT]);
+            bool expired = phone_request_expire(&s_phone_request, now_ms());
+            phone_request_t request = s_phone_request;
+            xSemaphoreGive(s_mutex);
+            if (ack || expired)
+                ESP_LOGI(TAG, "PHONE_COMMAND_END command=%u request=%u result=%u",
+                         request.last_command, request.sequence, request.result);
+            // Drop this connection after an uncertain timeout; never replay.
+            if (expired)
+                break;
+            if (in.reserved[CONTROL_PHONE_CAPS] == PHONE_CONTROL_VERSION) {
+                control_packet_t meta;
+                if (!control_receive(fd, &meta, PHONE_STATUS_TYPE, true, binding) ||
+                    meta.sequence != seq || memcmp(meta.client_nonce, client, 16) ||
+                    memcmp(meta.server_nonce, server, 16))
+                    break;
+                phone_status_t phone;
+                memcpy(&phone, &meta.session, sizeof(phone));
+                if (!phone_status_valid(&phone)) {
+                    ESP_LOGW(TAG, "PHONE_STATUS invalid_payload");
+                    break;
+                }
+                xSemaphoreTake(s_mutex, portMAX_DELAY);
+                bool changed = !s_phone_available || phone.revision != s_phone_status.revision;
+                s_phone_status = phone;
+                s_phone_duration_ms = get_u32(&in.reserved[CONTROL_PHONE_CALL_ID]);
+                s_phone_available = true;
+                s_phone_seen_at = now_ms();
+                xSemaphoreGive(s_mutex);
+                if (changed)
+                    ESP_LOGI(TAG,
+                             "PHONE_EVENT call_id=%" PRIu32 " revision=%" PRIu32
+                             " phase=%u setup=%u active=%u flags=%u remaining_ms=%u",
+                             phone.call_id, phone.revision, phone.phase, phone.setup, phone.active,
+                             phone.flags, phone.remaining_ms);
+            }
+        }
         heartbeat = seq;
         s_last_link = now_ms();
         xSemaphoreTake(s_mutex, portMAX_DELAY);
@@ -1032,7 +1302,8 @@ static bool session(int fd, uint32_t ip, const binding_t* binding) {
             ESP_LOGI(TAG, "remote heartbeat hfp=%u sco=%u rate=%u rx=%" PRIu32 " tx=%" PRIu32,
                      in.hfp, in.sco, in.rate, in.rx, in.tx);
         }
-        vTaskDelay(pdMS_TO_TICKS(s_host ? 2000 : 10));
+        vTaskDelay(pdMS_TO_TICKS(
+            s_host ? (in.reserved[CONTROL_PHONE_CAPS] == PHONE_CONTROL_VERSION ? 500 : 2000) : 10));
     }
 done:
     ESP_LOGW(TAG, "control closed role=%s authenticated=%d heartbeat=%" PRIu32 " age_ms=%" PRId64,
@@ -1235,6 +1506,17 @@ static void worker(void* arg) {
         s_hooks.configure(s_binding.ssid, s_binding.password);
     while (true) {
         event_t e;
+        if (s_host) {
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            bool expired = phone_request_expire(&s_phone_request, now_ms());
+            phone_request_t request = s_phone_request;
+            xSemaphoreGive(s_mutex);
+            if (expired) {
+                ESP_LOGW(TAG, "PHONE_COMMAND_END command=%u request=%u result=timeout",
+                         request.last_command, request.sequence);
+                peer(0, false);
+            }
+        }
         if (xQueueReceive(s_queue, &e, pdMS_TO_TICKS(20)) == pdTRUE) {
             if (e.kind == E_COMMAND)
                 process_command(&e);
@@ -1272,7 +1554,10 @@ static void worker(void* arg) {
                     if (!s_host && s_readback.op == P_DONE)
                         close_ble();
                     else {
-                        fail("ble_disconnected");
+                        fail(s_host && !strcmp(s_stage, "waiting_button") &&
+                                     now_ms() >= s_confirm_deadline
+                                 ? "button_confirmation_timeout"
+                                 : "ble_disconnected");
                         close_ble();
                         stage("provision_failed");
                     }
@@ -1291,6 +1576,7 @@ static void worker(void* arg) {
         }
         if (s_scanning && now - s_last_poll >= 8500) {
             s_scanning = false;
+            s_scan_done_serial = s_scan_serial;
             if (s_recovery_scan) {
                 s_recovery_scan = false;
                 fail("recovery_gateway_not_found");
@@ -1350,6 +1636,12 @@ static void worker(void* arg) {
                 s_deadline = now + 5000;
             }
         }
+        if (s_host && s_request && !s_config_sent && !strcmp(s_stage, "waiting_button") &&
+            now >= s_confirm_deadline) {
+            fail("button_confirmation_timeout");
+            close_ble();
+            stage("provision_failed");
+        }
         if (s_request && !s_candidate && now >= s_deadline) {
             ESP_LOGW(TAG, "provision deadline expired stage=%s config_sent=%d", s_stage,
                      s_config_sent);
@@ -1405,6 +1697,8 @@ static void worker(void* arg) {
 #endif
             led_update(now);
         }
+        if (s_host)
+            publish_ui_status();
     }
 }
 esp_err_t gateway_manager_start(bool host, const gateway_manager_hooks_t* hooks) {

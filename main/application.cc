@@ -1,4 +1,6 @@
 #include "application.h"
+#include "background_work.h"
+#include "call_records.h"
 #if CONFIG_GATEWAY_MANAGER
 #include "gateway_manager.h"
 #include "gateway_serial.h"
@@ -76,6 +78,31 @@ void Application::Initialize() {
     auto& board = Board::GetInstance();
     SetDeviceState(kDeviceStateStarting);
 
+    // Activation reads NVS and can update flash, even with Aliyun selected.
+    // Reserve its internal stack before Bluetooth/audio fragment internal RAM.
+    if (xTaskCreate(
+            [](void* arg) {
+                auto* app = static_cast<Application*>(arg);
+                for (;;) {
+                    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+                    app->ActivationTask();
+                    ESP_LOGI(TAG, "activation stack remaining=%u bytes",
+                             unsigned(uxTaskGetStackHighWaterMark(nullptr)));
+                    app->activation_running_.store(false);
+                }
+            },
+            "activation", 8192, this, 2, &activation_task_) != pdPASS) {
+        ESP_LOGE(TAG,
+                 "activation stack allocation failed: internal free=%u min=%u largest=%u psram "
+                 "free=%u largest=%u requested=8192 caps=0x%lx",
+                 unsigned(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+                 unsigned(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+                 unsigned(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+                 unsigned(heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)),
+                 unsigned(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)),
+                 (unsigned long)(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    }
+
 #if CONFIG_GATEWAY_MANAGER
     // BLE controller memory must be reserved before the audio front end and
     // wake-word models consume the remaining internal heap.
@@ -93,8 +120,22 @@ void Application::Initialize() {
     auto codec = board.GetAudioCodec();
     audio_service_.Initialize(codec);
     audio_service_.Start();
+    CallRecords::Instance().Start();
 #if CONFIG_PHONE_BRIDGE
     phone_bridge_ = std::make_unique<PhoneBridge>(audio_service_);
+    PhoneBridgeCallbacks phone_callbacks;
+    phone_callbacks.on_call_active = [this](bool active) {
+#if CONFIG_ALIYUN_REALTIME
+        // Capture before StopPhoneAi resets the bridge route. A stale media
+        // path is not an authenticated phone hangup, regardless of whether
+        // this callback or the cloud worker reaches the main task first.
+        const auto failure = active ? PhoneAiFailure::None : phone_bridge_->AiAudioFailure();
+        Schedule([this, active, failure]() { HandlePhoneCallActive(active, failure); });
+#else
+        (void)active;
+#endif
+    };
+    phone_bridge_->SetCallbacks(std::move(phone_callbacks));
     // Start the LAN bridge with the audio service. Some boards report their
     // network as already connected before the application installs its event
     // callback, so waiting exclusively for NetworkEvent::Connected can leave
@@ -106,8 +147,10 @@ void Application::Initialize() {
 
     AudioServiceCallbacks callbacks;
     callbacks.on_send_queue_available = [this]() {
-        if (audio_service_.IsPcmTransport())
-            return;  // PhoneBridge exclusively drains the local PCM transport.
+#if CONFIG_PHONE_BRIDGE
+        if (phone_bridge_ && phone_bridge_->UsesLocalAudio())
+            return;
+#endif
         xEventGroupSetBits(event_group_, MAIN_EVENT_SEND_AUDIO);
     };
     callbacks.on_wake_word_detected = [this](const std::string& wake_word) {
@@ -291,7 +334,11 @@ void Application::Run() {
             HandleStopListeningEvent();
         }
 
-        if ((bits & MAIN_EVENT_SEND_AUDIO) && !audio_service_.IsPcmTransport()) {
+        if ((bits & MAIN_EVENT_SEND_AUDIO)
+#if CONFIG_PHONE_BRIDGE
+            && !(phone_bridge_ && phone_bridge_->UsesLocalAudio())
+#endif
+        ) {
             for (int sent = 0; sent < 16; ++sent) {
                 auto packet = audio_service_.PopPacketFromSendQueue();
                 if (!packet)
@@ -340,6 +387,33 @@ void Application::Run() {
 
         if (bits & MAIN_EVENT_CLOCK_TICK) {
             clock_ticks_++;
+#if CONFIG_PHONE_BRIDGE && CONFIG_ALIYUN_REALTIME && CONFIG_GATEWAY_MANAGER
+            phone_status_t phone_policy{};
+            int64_t policy_age = 0;
+            uint32_t policy_duration = 0;
+            if (gateway_manager_get_phone_status(&phone_policy, &policy_age, &policy_duration)) {
+                // Keep the failure visible during the affected call. Once the
+                // authenticated phone status confirms it has ended and its
+                // worker is gone, allow a new call without rebooting the S3.
+                if (phone_ai_state_ == PhoneAiState::Failed && !phone_call_active_ &&
+                    !phone_ai_worker_active_ &&
+                    (phone_policy.phase == PHONE_IDLE || phone_policy.phase == PHONE_ENDED)) {
+                    SetPhoneAiState(aliyun_mode_ && protocol_ ? PhoneAiState::Ready
+                                                              : PhoneAiState::Unavailable);
+                    ESP_LOGI(TAG, "PHONE_AI failure_cleared reason=call_ended call_id=%" PRIu32,
+                             phone_policy.call_id);
+                }
+                const bool unavailable = phone_ai_state_ == PhoneAiState::Unavailable ||
+                                         phone_ai_state_ == PhoneAiState::Failed;
+                if (unavailable && (phone_policy.flags & PHONE_AUTO_ENABLED)) {
+                    if (gateway_manager_phone_command(GATEWAY_PHONE_CMD_AUTO_OFF))
+                        phone_auto_suppressed_ = true;
+                } else if (!unavailable && phone_auto_suppressed_) {
+                    if (gateway_manager_phone_command(GATEWAY_PHONE_CMD_AUTO_ON))
+                        phone_auto_suppressed_ = false;
+                }
+            }
+#endif
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
 
@@ -371,19 +445,18 @@ void Application::HandleNetworkConnectedEvent() {
     if (state == kDeviceStateStarting || state == kDeviceStateWifiConfiguring) {
         // Network is ready, start activation
         SetDeviceState(kDeviceStateActivating);
-        if (activation_task_handle_ != nullptr) {
+        if (activation_running_.exchange(true)) {
             ESP_LOGW(TAG, "Activation task already running");
             return;
         }
 
-        xTaskCreate(
-            [](void* arg) {
-                Application* app = static_cast<Application*>(arg);
-                app->ActivationTask();
-                app->activation_task_handle_ = nullptr;
-                vTaskDelete(NULL);
-            },
-            "activation", 4096 * 2, this, 2, &activation_task_handle_);
+        if (activation_task_) {
+            xTaskNotifyGive(activation_task_);
+        } else {
+            activation_running_.store(false);
+            last_error_message_ = "Activation task allocation failed";
+            xEventGroupSetBits(event_group_, MAIN_EVENT_ERROR);
+        }
     }
 
     // Update the status bar immediately to show the network state
@@ -640,11 +713,15 @@ void Application::InitializeProtocol() {
 
 #if CONFIG_ALIYUN_REALTIME
     const auto aliyun_config = LoadAliyunRealtimeConfig();
+    CallRecords::Instance().ConfigureCloud(aliyun_config);
     if (aliyun_config.selected) {
         protocol_ = std::make_unique<AliyunProtocol>(aliyun_config);
         audio_service_.SetPcmTransport(true);
         audio_service_.EnableDeviceAec(false);
         aliyun_mode_ = true;
+#if CONFIG_PHONE_BRIDGE
+        SetPhoneAiState(PhoneAiState::Ready);
+#endif
         audio_service_.EnableRawCapture(aliyun_config.debug_enabled &&
                                         aliyun_config.debug_input_pcm);
     } else
@@ -668,6 +745,13 @@ void Application::InitializeProtocol() {
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
 #if CONFIG_ALIYUN_REALTIME
         if (packet->pcm) {
+#if CONFIG_PHONE_BRIDGE
+            if (phone_ai_worker_active_) {
+                if (phone_ai_mode_ && phone_ai_cloud_ready_ && phone_bridge_)
+                    phone_bridge_->QueueAiDownlink(std::move(packet));
+                return;
+            }
+#endif
             if (aliyun_mode_ && !audio_service_.PushPacketToDecodeQueue(std::move(packet)))
                 DebugTrace::Instance().Gap("device downlink queue overflow");
             return;
@@ -689,6 +773,10 @@ void Application::InitializeProtocol() {
     });
 
     protocol_->OnAudioChannelClosed([this, &board]() {
+#if CONFIG_PHONE_BRIDGE && CONFIG_ALIYUN_REALTIME
+        if (phone_ai_worker_active_)
+            return;
+#endif
         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
         Schedule([this]() {
             if (protocol_ && protocol_->IsAudioChannelOpened())
@@ -849,11 +937,36 @@ void Application::InitializeProtocol() {
 #if CONFIG_ALIYUN_REALTIME
     if (aliyun_mode_) {
         auto* aliyun = static_cast<AliyunProtocol*>(protocol_.get());
+        aliyun->OnSpeechStopped([this]() {
+#if CONFIG_PHONE_BRIDGE
+            if (phone_ai_mode_) {
+                phone_ai_listening_.store(false);
+                const auto epoch = phone_ai_generation_.load();
+                Schedule([this, epoch]() {
+                    if (phone_ai_mode_ && epoch == phone_ai_generation_)
+                        SetPhoneAiState(PhoneAiState::Thinking);
+                });
+            }
+#endif
+        });
         aliyun->OnResponseStarted([this, aliyun](uint64_t token) {
+#if CONFIG_PHONE_BRIDGE
+            if (phone_ai_mode_) {
+                phone_ai_listening_.store(false);
+                phone_ai_reply_done_.store(false);
+            }
+#endif
             Schedule([this, aliyun, token]() {
                 if (protocol_.get() != aliyun || !aliyun->IsCurrentResponse(token))
                     return;
                 aliyun_response_done_ = false;
+#if CONFIG_PHONE_BRIDGE
+                if (phone_ai_mode_) {
+                    SetPhoneAiState(PhoneAiState::Speaking);
+                    Board::GetInstance().GetDisplay()->SetStatus("电话 AI 回复");
+                    return;
+                }
+#endif
                 if (GetDeviceState() == kDeviceStateListening ||
                     GetDeviceState() == kDeviceStateIdle) {
                     SetDeviceState(kDeviceStateSpeaking);
@@ -861,10 +974,20 @@ void Application::InitializeProtocol() {
             });
         });
         aliyun->OnResponseDone([this, aliyun](uint64_t token) {
+#if CONFIG_PHONE_BRIDGE
+            if (phone_ai_mode_)
+                phone_ai_reply_done_.store(true);
+#endif
             Schedule([this, aliyun, token]() {
                 if (protocol_.get() != aliyun || !aliyun->IsCurrentResponse(token))
                     return;
                 aliyun_response_done_ = true;
+#if CONFIG_PHONE_BRIDGE
+                if (phone_ai_mode_) {
+                    Board::GetInstance().GetDisplay()->SetStatus("电话 AI 播放中");
+                    return;
+                }
+#endif
                 if (GetDeviceState() == kDeviceStateSpeaking && audio_service_.IsPlaybackIdle()) {
                     aliyun_response_done_ = false;
                     SetDeviceState(listening_mode_ == kListeningModeManualStop
@@ -878,6 +1001,15 @@ void Application::InitializeProtocol() {
             Schedule([this, display, aliyun, generation, user, text]() {
                 if (protocol_.get() != aliyun || generation != aliyun->connection_generation())
                     return;
+#if CONFIG_PHONE_BRIDGE
+                if (phone_ai_mode_) {
+                    CallRecords::Instance().Transcript(user, text.c_str());
+                    display->AddPhoneTranscript(user, text.c_str());
+                    if (user && phone_ai_listening_)
+                        SetPhoneAiState(PhoneAiState::Thinking);
+                    return;
+                }
+#endif
                 display->SetChatMessage(user ? "user" : "assistant", text.c_str());
             });
         });
@@ -941,6 +1073,10 @@ void Application::CycleListeningMode() {
 
 void Application::EndConversation() {
     Schedule([this]() {
+#if CONFIG_PHONE_BRIDGE && CONFIG_ALIYUN_REALTIME
+        if (phone_call_active_ || phone_ai_worker_active_)
+            return;
+#endif
         const auto state = GetDeviceState();
         if (state != kDeviceStateIdle && state != kDeviceStateConnecting &&
             state != kDeviceStateListening && state != kDeviceStateSpeaking)
@@ -959,6 +1095,10 @@ void Application::EndConversation() {
 }
 
 void Application::HandleCycleListeningModeEvent() {
+#if CONFIG_PHONE_BRIDGE && CONFIG_ALIYUN_REALTIME
+    if (phone_call_active_ || phone_ai_worker_active_)
+        return;
+#endif
     const auto state = GetDeviceState();
     if (state != kDeviceStateIdle && state != kDeviceStateListening &&
         state != kDeviceStateSpeaking)
@@ -1011,6 +1151,10 @@ void Application::StartListening() { xEventGroupSetBits(event_group_, MAIN_EVENT
 void Application::StopListening() { xEventGroupSetBits(event_group_, MAIN_EVENT_STOP_LISTENING); }
 
 void Application::HandleToggleChatEvent() {
+#if CONFIG_PHONE_BRIDGE && CONFIG_ALIYUN_REALTIME
+    if (phone_call_active_ || phone_ai_worker_active_)
+        return;
+#endif
     auto state = GetDeviceState();
 
     if (state == kDeviceStateNotifying) {
@@ -1066,6 +1210,10 @@ void Application::HandleToggleChatEvent() {
 }
 
 void Application::ContinueOpenAudioChannel(ListeningMode mode) {
+#if CONFIG_PHONE_BRIDGE && CONFIG_ALIYUN_REALTIME
+    if (phone_call_active_ || phone_ai_worker_active_)
+        return;
+#endif
     // Check state again in case it was changed during scheduling
     if (GetDeviceState() != kDeviceStateConnecting) {
         return;
@@ -1085,6 +1233,13 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
             const bool opened = connection->OpenAudioChannel();
             Schedule([this, connection, mode, opened]() {
                 aliyun_connecting_ = false;
+#if CONFIG_PHONE_BRIDGE
+                if (phone_call_active_) {
+                    connection->CloseAudioChannel();
+                    StartPhoneAi();
+                    return;
+                }
+#endif
                 if (protocol_ != connection || GetDeviceState() != kDeviceStateConnecting) {
                     connection->CloseAudioChannel();
                     return;
@@ -1123,6 +1278,10 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
 }
 
 void Application::HandleStartListeningEvent() {
+#if CONFIG_PHONE_BRIDGE && CONFIG_ALIYUN_REALTIME
+    if (phone_call_active_ || phone_ai_worker_active_)
+        return;
+#endif
     auto state = GetDeviceState();
 
     if (state == kDeviceStateNotifying) {
@@ -1163,6 +1322,10 @@ void Application::HandleStartListeningEvent() {
 }
 
 void Application::HandleStopListeningEvent() {
+#if CONFIG_PHONE_BRIDGE && CONFIG_ALIYUN_REALTIME
+    if (phone_call_active_ || phone_ai_worker_active_)
+        return;
+#endif
     auto state = GetDeviceState();
 
     if (state == kDeviceStateNotifying) {
@@ -1189,6 +1352,10 @@ void Application::HandleStopListeningEvent() {
 }
 
 void Application::HandleWakeWordDetectedEvent() {
+#if CONFIG_PHONE_BRIDGE && CONFIG_ALIYUN_REALTIME
+    if (phone_call_active_ || phone_ai_worker_active_)
+        return;
+#endif
     if (!protocol_) {
         return;
     }
@@ -1262,6 +1429,10 @@ void Application::BeginWakeWordInvoke(const std::string& wake_word) {
 }
 
 void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
+#if CONFIG_PHONE_BRIDGE && CONFIG_ALIYUN_REALTIME
+    if (phone_call_active_ || phone_ai_worker_active_)
+        return;
+#endif
     // Check state again in case it was changed during scheduling
     if (GetDeviceState() != kDeviceStateConnecting) {
         return;
@@ -1315,6 +1486,13 @@ void Application::HandleStateChangedEvent() {
     auto display = board.GetDisplay();
     auto led = board.GetLed();
     led->OnStateChanged();
+#if CONFIG_PHONE_BRIDGE && CONFIG_ALIYUN_REALTIME
+    if (phone_call_active_ || phone_ai_worker_active_) {
+        audio_service_.EnableVoiceProcessing(false);
+        audio_service_.EnableWakeWordDetection(false);
+        return;
+    }
+#endif
 
     switch (new_state) {
         case kDeviceStateUnknown:
@@ -1499,6 +1677,12 @@ void Application::ConfigureWakeWordForListening() {
 }
 
 void Application::StartNotification(std::string audio_url, std::vector<NotifySubtitle> subtitles) {
+#if CONFIG_PHONE_BRIDGE && CONFIG_ALIYUN_REALTIME
+    if (phone_call_active_ || phone_ai_worker_active_) {
+        ESP_LOGW(TAG, "Ignoring notification during phone call");
+        return;
+    }
+#endif
     if (GetDeviceState() != kDeviceStateIdle || notify_player_.IsBusy()) {
         ESP_LOGW(TAG, "Ignoring notify message while device is busy");
         return;
@@ -1563,6 +1747,176 @@ void Application::HandleNotificationFinished(uint32_t playback_id, bool success)
              success ? "completed" : "failed");
     StopNotification();
 }
+
+#if CONFIG_PHONE_BRIDGE && CONFIG_ALIYUN_REALTIME
+void Application::SetPhoneAiState(PhoneAiState state, PhoneAiFailure failure) {
+    phone_ai_failure_.store(state == PhoneAiState::Failed ? failure : PhoneAiFailure::None);
+    phone_ai_state_.store(state);
+    if (state == PhoneAiState::Failed)
+        ESP_LOGW(TAG, "PHONE_AI state=failed error=%s epoch=%lu", PhoneAiFailureName(failure),
+                 (unsigned long)phone_ai_generation_.load());
+    Board::GetInstance().GetDisplay()->SetPhoneAiState(state);
+}
+
+void Application::HandlePhoneCallActive(bool active, PhoneAiFailure failure) {
+    phone_call_active_ = active;
+    if (active) {
+        StartPhoneAi();
+    } else {
+        StopPhoneAi(failure);
+    }
+}
+
+void Application::StartPhoneAi() {
+    if (phone_ai_mode_ || phone_ai_worker_active_ || aliyun_connecting_ || !aliyun_mode_ ||
+        !protocol_) {
+        if (!aliyun_mode_)
+            ESP_LOGW(TAG, "PHONE_AI unavailable: Aliyun realtime is not selected");
+        return;
+    }
+    const uint32_t generation = ++phone_ai_generation_;
+    if (!phone_bridge_->SetAiRoute(true)) {
+        SetPhoneAiState(PhoneAiState::Failed, PhoneAiFailure::AudioMemory);
+        Board::GetInstance().GetDisplay()->SetStatus("电话 AI 音频内存不足");
+        return;
+    }
+    phone_ai_mode_.store(true);
+    phone_ai_worker_active_ = true;
+    phone_ai_cloud_ready_.store(false);
+    phone_ai_listening_.store(false);
+    phone_ai_reply_done_.store(false);
+    aliyun_response_done_ = false;
+    pending_manual_commit_ = false;
+    SetDeviceState(kDeviceStateIdle);
+    audio_service_.EnableVoiceProcessing(false);
+    audio_service_.EnableWakeWordDetection(false);
+    audio_service_.EnablePcmCapture(false);
+    audio_service_.DiscardUplink();
+    audio_service_.ResetDecoder();
+    Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+    SetPhoneAiState(PhoneAiState::Connecting);
+    Board::GetInstance().GetDisplay()->SetStatus("电话 AI 连接中");
+    auto connection = protocol_;
+    if (!StartBackgroundWork("phone_ai", 8192, 3, [this, connection, generation]() {
+            // This worker alone owns phone-cloud writes and closing. The paced UDP
+            // task only puts PCM in a bounded queue; TLS cannot stall HFP pacing.
+            connection->CloseAudioChannel();
+            const bool opened = connection->OpenAudioChannel();
+            auto current = [this, generation]() {
+                return phone_ai_mode_.load() && generation == phone_ai_generation_.load();
+            };
+            if (opened && current()) {
+                phone_ai_cloud_ready_.store(true);
+                connection->SendStartListening(kListeningModeAutoStop);
+                phone_ai_listening_.store(true);
+                Schedule([this, generation]() {
+                    if (generation == phone_ai_generation_ && phone_ai_mode_) {
+                        SetPhoneAiState(PhoneAiState::Listening);
+                        Board::GetInstance().GetDisplay()->SetStatus("电话 AI 聆听");
+                    }
+                });
+                ESP_LOGI(TAG,
+                         "PHONE_AI route=active cloud=ready epoch=%lu input=phone_hfp output=hfp",
+                         (unsigned long)generation);
+            }
+            uint32_t sent = 0, send_failed = 0;
+            const char* reason = opened ? "call_ended" : "cloud_open_failed";
+            auto failure = opened ? PhoneAiFailure::None : PhoneAiFailure::CloudConnect;
+            while (opened && current()) {
+                // Preserve the first bridge failure before route cleanup resets it.
+                const auto audio_failure = phone_bridge_->AiAudioFailure();
+                if (!connection->IsAudioChannelOpened() || audio_failure != PhoneAiFailure::None) {
+                    failure = audio_failure != PhoneAiFailure::None
+                                  ? audio_failure
+                                  : PhoneAiFailure::CloudDisconnected;
+                    reason = audio_failure != PhoneAiFailure::None ? "audio_path_failed"
+                                                                   : "cloud_disconnected";
+                    break;
+                }
+                auto packet = phone_bridge_->PopPhoneUplink();
+                if (packet && phone_ai_listening_.load()) {
+                    if (connection->SendAudio(std::move(packet))) {
+                        if (++sent == 1 || sent % 250 == 0)
+                            ESP_LOGI(TAG,
+                                     "PHONE_AI cloud_uplink_packets=%lu failed=%lu epoch=%lu "
+                                     "stack_free=%u",
+                                     (unsigned long)sent, (unsigned long)send_failed,
+                                     (unsigned long)generation,
+                                     unsigned(uxTaskGetStackHighWaterMark(nullptr)));
+                    } else
+                        ++send_failed;
+                }
+                if (phone_ai_reply_done_.load() && phone_bridge_->AiPlaybackIdle()) {
+                    phone_ai_reply_done_.store(false);
+                    // Discard queued callers' audio captured during the reply: the
+                    // first release is half duplex, with a fresh listening turn.
+                    while (phone_bridge_->PopPhoneUplink()) {
+                    }
+                    connection->SendStartListening(kListeningModeAutoStop);
+                    phone_ai_listening_.store(true);
+                    ESP_LOGI(TAG, "PHONE_AI reply_drained listen_resumed epoch=%lu",
+                             (unsigned long)generation);
+                    Schedule([this, generation]() {
+                        if (generation == phone_ai_generation_ && phone_ai_mode_) {
+                            SetPhoneAiState(PhoneAiState::Listening);
+                            Board::GetInstance().GetDisplay()->SetStatus("电话 AI 聆听");
+                        }
+                    });
+                }
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+            phone_ai_listening_.store(false);
+            phone_ai_cloud_ready_.store(false);
+            connection->CloseAudioChannel();
+            ESP_LOGI(TAG, "PHONE_AI worker_stopped reason=%s epoch=%lu uplink=%lu failed=%lu",
+                     reason, (unsigned long)generation, (unsigned long)sent,
+                     (unsigned long)send_failed);
+            Schedule([this, generation, failure]() {
+                phone_ai_worker_active_ = false;
+                if (generation == phone_ai_generation_) {
+                    phone_ai_mode_.store(false);
+                    phone_bridge_->SetAiRoute(false);
+                    audio_service_.EnablePcmCapture(false);
+                    SetPhoneAiState(PhoneAiState::Failed, failure);
+                    Board::GetInstance().GetDisplay()->SetStatus("电话 AI 断开");
+                } else if (phone_call_active_) {
+                    StartPhoneAi();
+                } else {
+                    audio_service_.EnableWakeWordDetection(true);
+                    Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+                }
+            });
+        })) {
+        phone_ai_mode_.store(false);
+        phone_ai_worker_active_ = false;
+        phone_bridge_->SetAiRoute(false);
+        audio_service_.EnablePcmCapture(false);
+        SetPhoneAiState(PhoneAiState::Failed, PhoneAiFailure::WorkerResources);
+        Board::GetInstance().GetDisplay()->SetStatus("电话 AI 内存不足");
+    }
+}
+
+void Application::StopPhoneAi(PhoneAiFailure failure) {
+    ++phone_ai_generation_;
+    phone_ai_mode_.store(false);
+    phone_ai_cloud_ready_.store(false);
+    phone_ai_listening_.store(false);
+    if (phone_bridge_)
+        phone_bridge_->SetAiRoute(false);
+    audio_service_.DiscardUplink();
+    audio_service_.ResetDecoder();
+    audio_service_.EnablePcmCapture(false);
+    if (failure != PhoneAiFailure::None)
+        SetPhoneAiState(PhoneAiState::Failed, failure);
+    else if (phone_ai_state_ != PhoneAiState::Failed)
+        SetPhoneAiState(PhoneAiState::Ready);
+    SetDeviceState(kDeviceStateIdle);
+    audio_service_.EnableWakeWordDetection(true);
+    Board::GetInstance().GetDisplay()->SetStatus("待机");
+    ESP_LOGI(TAG, "PHONE_AI route=stopped reason=%s",
+             failure == PhoneAiFailure::None ? "call_ended" : PhoneAiFailureName(failure));
+}
+#endif
 
 void Application::Schedule(std::function<void()>&& callback) {
     {

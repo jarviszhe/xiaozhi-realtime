@@ -43,6 +43,8 @@ private:
         int16_t data[1024];
     };
     QueueHandle_t raw_queue_ = nullptr;
+    StaticQueue_t raw_queue_control_{};
+    uint8_t* raw_queue_storage_ = nullptr;
     std::atomic<bool> input_enabled_{false};
     std::atomic<bool> trace_active_{false};
     std::atomic<uint32_t> raw_dropped_{0};

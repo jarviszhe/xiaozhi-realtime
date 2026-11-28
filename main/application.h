@@ -20,6 +20,7 @@
 #include "device_state_machine.h"
 #include "notify/notify_player.h"
 #include "ota.h"
+#include "phone_ai_state.h"
 #include "protocol.h"
 #if CONFIG_PHONE_BRIDGE
 #include "phone_bridge.h"
@@ -127,6 +128,28 @@ public:
     AecMode GetAecMode() const { return aec_mode_; }
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
+    PhoneAiState GetPhoneAiState() const {
+#if CONFIG_PHONE_BRIDGE && CONFIG_ALIYUN_REALTIME
+        return phone_ai_state_.load();
+#else
+        return PhoneAiState::Unavailable;
+#endif
+    }
+    PhoneAiFailure GetPhoneAiFailure() const {
+#if CONFIG_PHONE_BRIDGE && CONFIG_ALIYUN_REALTIME
+        return phone_ai_failure_.load();
+#else
+        return PhoneAiFailure::None;
+#endif
+    }
+    void RetryPhoneAi() {
+#if CONFIG_PHONE_BRIDGE && CONFIG_ALIYUN_REALTIME
+        Schedule([this]() {
+            if (phone_call_active_ && !phone_ai_worker_active_)
+                StartPhoneAi();
+        });
+#endif
+    }
 
     /**
      * Reset protocol resources (thread-safe)
@@ -156,6 +179,17 @@ private:
     AudioService audio_service_;
 #if CONFIG_PHONE_BRIDGE
     std::unique_ptr<PhoneBridge> phone_bridge_;
+#if CONFIG_ALIYUN_REALTIME
+    std::atomic<bool> phone_ai_mode_{false};
+    std::atomic<bool> phone_ai_listening_{false}, phone_ai_reply_done_{false};
+    std::atomic<uint32_t> phone_ai_generation_{0};
+    bool phone_call_active_ = false;
+    std::atomic<bool> phone_ai_worker_active_{false};
+    std::atomic<bool> phone_ai_cloud_ready_{false};
+    std::atomic<PhoneAiState> phone_ai_state_{PhoneAiState::Unavailable};
+    std::atomic<PhoneAiFailure> phone_ai_failure_{PhoneAiFailure::None};
+    bool phone_auto_suppressed_ = false;
+#endif
 #endif
     NotifyPlayer notify_player_;
     uint32_t notification_playback_id_ = 0;
@@ -179,7 +213,8 @@ private:
     bool pending_manual_commit_ = false;
 #endif
     int clock_ticks_ = 0;
-    TaskHandle_t activation_task_handle_ = nullptr;
+    std::atomic<bool> activation_running_{false};
+    TaskHandle_t activation_task_ = nullptr;
 
     // Event handlers
     void HandleStateChangedEvent();
@@ -202,6 +237,12 @@ private:
     void StartNotification(std::string audio_url, std::vector<NotifySubtitle> subtitles);
     void StopNotification();
     void HandleNotificationFinished(uint32_t playback_id, bool success);
+#if CONFIG_PHONE_BRIDGE && CONFIG_ALIYUN_REALTIME
+    void HandlePhoneCallActive(bool active, PhoneAiFailure failure);
+    void StartPhoneAi();
+    void StopPhoneAi(PhoneAiFailure failure = PhoneAiFailure::None);
+    void SetPhoneAiState(PhoneAiState state, PhoneAiFailure failure = PhoneAiFailure::None);
+#endif
 
     // Activation task (runs in background)
     void ActivationTask();

@@ -49,6 +49,15 @@ config GATEWAY_DEBUG_COMMANDS
     depends on GATEWAY_MANAGER
     default n
 
+config PHONE_RECORDS
+    bool "SD phone recordings and call history"
+    depends on GATEWAY_MANAGER && ALIYUN_REALTIME && SPIRAM
+    default y if BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_5B
+    default n
+    help
+        Bounded external-memory queues and a separate SD writer. Storage is
+        optional: failures must not stop a phone call. Never formats the card.
+
 choice
     prompt "Flash Assets"
     default FLASH_DEFAULT_ASSETS if !USE_EMOTE_MESSAGE_STYLE
